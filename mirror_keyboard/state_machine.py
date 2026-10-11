@@ -47,6 +47,7 @@ class KeyboardStateMachine:
         self._shortcut_active = False
         self._highlighted_key: str | None = None
         self._event_text = "Ready"
+        self._modifier_event = "No mirror modifier event detected yet"
         self._listeners: list[Callable[[ViewState], None]] = []
         self._lock = RLock()
 
@@ -97,8 +98,13 @@ class KeyboardStateMachine:
                 shortcut_status=shortcut_status,
                 labels=labels,
                 highlighted_key=self._highlighted_key,
-                event_text=self._event_text,
+                event_text=f"{self._modifier_event} | {self._event_text}",
             )
+
+    def note_modifier_event(self, description: str) -> None:
+        with self._lock:
+            self._modifier_event = description
+        self._publish()
 
     def advance_time(self, now: float) -> None:
         changed = False

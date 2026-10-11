@@ -20,6 +20,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional CSV with physical_key,shortcut columns",
     )
     parser.add_argument("--double-tap-ms", type=int, default=300)
+    parser.add_argument(
+        "--mirror-key",
+        choices=("right-alt", "caps-lock", "f12"),
+        default="right-alt",
+        help="physical key used for single/double-tap mirror activation",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="log Right Alt and Korean IME-related low-level key events",
+    )
     return parser
 
 
@@ -41,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
         state_machine,
         layout_path=args.layout,
         shortcut_path=args.shortcut_profile,
+        mirror_key=args.mirror_key,
+        verbose=args.verbose,
     )
     overlay = KeyboardOverlay(session)
     session.attach_overlay(overlay)

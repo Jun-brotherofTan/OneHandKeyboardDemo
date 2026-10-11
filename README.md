@@ -125,6 +125,20 @@ Emergency exit is `Ctrl+Alt+Esc`. It stops the keyboard hook, closes the
 overlay, flushes the console log, and exits without installing drivers,
 changing registry mappings, or persisting settings.
 
+On Korean Windows, Right Alt may be reported as `VK_HANGUL` or as an extended
+`scan 0x38` event instead of `VK_RMENU`. The hook recognizes these physical
+Right Alt forms and passes the default Right Alt event through to Windows so
+the IME can continue handling Hangul/English switching. Left Alt remains an
+ordinary Alt key. Use `--verbose` to print VK, scan code, extended, direction,
+and injected details for Alt/Hangul-related events; the overlay also shows the
+last detected physical modifier. If the IME still consumes the event before
+the hook sees it, choose another mirror key:
+
+```powershell
+python mirror_keyboard_test.py --layout layout_C.csv --mirror-key caps-lock --verbose
+python mirror_keyboard_test.py --layout layout_C.csv --mirror-key f12 --verbose
+```
+
 ## Corpus shortcut analyzer
 
 The analyzer ranks complete words and arbitrary overlapping substrings separately.

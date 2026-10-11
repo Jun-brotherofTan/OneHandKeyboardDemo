@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,12 +9,16 @@ from layout import KEYS
 from mirror_keyboard.layout_loader import load_layout_profile
 from mirror_keyboard.keyboard_hook import (
     VK_CONTROL,
+    VK_CAPITAL,
     VK_ESCAPE,
+    VK_HANGUL,
     VK_MENU,
     VK_LMENU,
     VK_RMENU,
     WM_KEYDOWN,
     WM_KEYUP,
+    LLKHF_EXTENDED,
+    LLKHF_INJECTED,
     WindowsKeyboardHook,
 )
 from mirror_keyboard.overlay_ui import fit_label_font_size, wrap_label_text
@@ -57,12 +63,16 @@ class FakeHookSession:
     def __init__(self):
         self.taps = 0
         self.shutdowns = 0
+        self.modifier_events = []
 
     def right_alt_tap(self):
         self.taps += 1
 
     def request_shutdown(self):
         self.shutdowns += 1
+
+    def report_modifier_event(self, description):
+        self.modifier_events.append(description)
 
 
 class MirrorKeyboardTestTests(unittest.TestCase):
@@ -194,14 +204,87 @@ class MirrorKeyboardTestTests(unittest.TestCase):
         get_async = lambda key: key_states.get(key, 0)
 
         with patch("mirror_keyboard.keyboard_hook.time.monotonic", side_effect=lambda: next(clock_values)):
-            hook._handle_event(VK_RMENU, WM_KEYDOWN, get_async)
-            hook._handle_event(VK_RMENU, WM_KEYUP, get_async)
-            hook._handle_event(VK_LMENU, WM_KEYDOWN, get_async)
-            hook._handle_event(VK_LMENU, WM_KEYUP, get_async)
-            hook._handle_event(VK_RMENU, WM_KEYDOWN, get_async)
-            hook._handle_event(VK_RMENU, WM_KEYUP, get_async)
+            self.assertFalse(hook._handle_event(VK_RMENU, WM_KEYDOWN, get_async))
+            self.assertFalse(hook._handle_event(VK_RMENU, WM_KEYUP, get_async))
+            self.assertFalse(hook._handle_event(VK_LMENU, WM_KEYDOWN, get_async))
+            self.assertFalse(hook._handle_event(VK_LMENU, WM_KEYUP, get_async))
+            self.assertFalse(hook._handle_event(VK_RMENU, WM_KEYDOWN, get_async))
+            self.assertFalse(hook._handle_event(VK_RMENU, WM_KEYUP, get_async))
 
         self.assertEqual(session.taps, 1)
+        self.assertTrue(any("Right Alt" in event for event in session.modifier_events))
+
+    def test_hangul_virtual_key_with_extended_right_alt_scan_activates_mirror(self):
+        session = FakeHookSession()
+        hook = WindowsKeyboardHook(session)
+        key_states = {VK_HANGUL: 0}
+        get_async = lambda key: key_states.get(key, 0)
+
+        with patch("mirror_keyboard.keyboard_hook.time.monotonic", side_effect=(1.0, 1.1)):
+            handled_down = hook._handle_event(
+                VK_HANGUL, WM_KEYDOWN, get_async, scan_code=0x38, flags=LLKHF_EXTENDED
+            )
+            handled_up = hook._handle_event(
+                VK_HANGUL, WM_KEYUP, get_async, scan_code=0x38, flags=LLKHF_EXTENDED
+            )
+
+        self.assertFalse(handled_down)
+        self.assertFalse(handled_up)
+        self.assertEqual(session.taps, 1)
+
+    def test_extended_scan_code_identifies_right_alt_when_vk_is_generic_menu(self):
+        session = FakeHookSession()
+        hook = WindowsKeyboardHook(session)
+        with patch("mirror_keyboard.keyboard_hook.time.monotonic", side_effect=(1.0, 1.1)):
+            hook._handle_event(VK_MENU, WM_KEYDOWN, lambda _key: 0, scan_code=0x38, flags=LLKHF_EXTENDED)
+            hook._handle_event(VK_MENU, WM_KEYUP, lambda _key: 0, scan_code=0x38, flags=LLKHF_EXTENDED)
+        self.assertEqual(session.taps, 1)
+
+    def test_non_extended_left_alt_scan_does_not_activate_mirror(self):
+        session = FakeHookSession()
+        hook = WindowsKeyboardHook(session)
+        with patch("mirror_keyboard.keyboard_hook.time.monotonic") as clock:
+            handled = hook._handle_event(
+                VK_LMENU, WM_KEYDOWN, lambda _key: 0, scan_code=0x38, flags=0
+            )
+        self.assertFalse(handled)
+        clock.assert_not_called()
+        self.assertEqual(session.taps, 0)
+
+    def test_caps_lock_can_be_selected_as_mirror_modifier(self):
+        session = FakeHookSession()
+        hook = WindowsKeyboardHook(session, mirror_key="caps-lock")
+        with patch("mirror_keyboard.keyboard_hook.time.monotonic", side_effect=(1.0, 1.1)):
+            self.assertTrue(hook._handle_event(VK_CAPITAL, WM_KEYDOWN, lambda _key: 0))
+            self.assertTrue(hook._handle_event(VK_CAPITAL, WM_KEYUP, lambda _key: 0))
+        self.assertEqual(session.taps, 1)
+
+    def test_verbose_right_alt_log_includes_physical_event_fields(self):
+        hook = WindowsKeyboardHook(FakeHookSession(), verbose=True)
+        output = StringIO()
+        with redirect_stdout(output):
+            hook._log_key_event(
+                VK_HANGUL,
+                0x38,
+                LLKHF_EXTENDED | LLKHF_INJECTED,
+                WM_KEYUP,
+                True,
+            )
+        message = output.getvalue()
+        self.assertIn("vk=0x15", message)
+        self.assertIn("scan=0x38", message)
+        self.assertIn("extended=True", message)
+        self.assertIn("up", message)
+        self.assertIn("injected=True", message)
+
+    def test_cli_exposes_alternative_mirror_key_and_verbose_options(self):
+        from mirror_keyboard_test import build_parser
+
+        args = build_parser().parse_args(
+            ["--layout", "layout_C.csv", "--mirror-key", "f12", "--verbose"]
+        )
+        self.assertEqual(args.mirror_key, "f12")
+        self.assertTrue(args.verbose)
 
     def test_emergency_hotkey_event_requests_shutdown(self):
         session = FakeHookSession()

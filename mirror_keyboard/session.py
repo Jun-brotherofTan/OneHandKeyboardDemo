@@ -20,6 +20,8 @@ class KeyboardTestSession:
         *,
         layout_path: str | Path,
         shortcut_path: str | Path | None = None,
+        mirror_key: str = "right-alt",
+        verbose: bool = False,
         hook=None,
         logger=None,
         clock=monotonic,
@@ -27,6 +29,8 @@ class KeyboardTestSession:
         self.state_machine = state_machine
         self.layout_path = Path(layout_path).resolve()
         self.shortcut_path = Path(shortcut_path).resolve() if shortcut_path else None
+        self.mirror_key = mirror_key
+        self.verbose = verbose
         self.profile_paths = standard_profile_paths(layout_path)
         self.hook = hook
         self.logger = logger or UsageLogger()
@@ -44,7 +48,9 @@ class KeyboardTestSession:
         if self.hook is None:
             from mirror_keyboard.keyboard_hook import WindowsKeyboardHook
 
-            self.hook = WindowsKeyboardHook(self)
+            self.hook = WindowsKeyboardHook(
+                self, mirror_key=self.mirror_key, verbose=self.verbose
+            )
         self.hook.start()
         print(f"Active profile: {self.state_machine.profile.name}", flush=True)
 
@@ -68,6 +74,9 @@ class KeyboardTestSession:
 
     def toggle_shortcut_mode(self) -> None:
         self.state_machine.toggle_shortcut()
+
+    def report_modifier_event(self, description: str) -> None:
+        self.state_machine.note_modifier_event(description)
 
     def switch_profile(self, number: str) -> None:
         path = self.profile_paths.get(number)
