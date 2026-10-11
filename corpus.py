@@ -5,18 +5,22 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
+from corpus_files import list_corpus_files
+
 
 def read_corpus(path: str | Path) -> str:
-    """Read one UTF-8 text file or all UTF-8 .txt files recursively."""
+    """Read one UTF-8 .txt file or all .txt and .py files in a directory."""
     source = Path(path)
     if source.is_file():
         if source.suffix.lower() != ".txt":
             raise ValueError(f"Input file must have a .txt extension: {source}")
         return source.read_text(encoding="utf-8")
     if source.is_dir():
-        files = sorted(item for item in source.rglob("*.txt") if item.is_file())
+        files = list_corpus_files(
+            source, include_nested_txt=True, case_sensitive_txt=True
+        )
         if not files:
-            raise ValueError(f"Directory contains no .txt files: {source}")
+            raise ValueError(f"Directory contains no .txt or .py files: {source}")
         return "\n".join(item.read_text(encoding="utf-8") for item in files)
     raise FileNotFoundError(f"Input path does not exist: {source}")
 

@@ -1,0 +1,128 @@
+import os as _os; _os.environ["MCIRC_NO_LOG_FILE"] = "1"      # tests must never write to the bot's real log
+import os, sys
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT); os.chdir(ROOT)
+"""Traffic, transit and weather: Environment Canada weather warnings for areas in any province or territory, picked by province then area.  No radio, no
+internet (a stand-in for Environment Canada's alerts service)."""
+import asyncio, importlib.util, tkinter as tk
+from unittest import mock
+
+import ec_areas
+import emergency_agent as ea
+
+fails = []
+def ok(label, cond, detail=""):
+    print(f"[{'PASS' if cond else 'FAIL'}] {label}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond: fails.append(label)
+
+provs = list(ec_areas.AREAS)
+ok("every province and territory has areas", len(provs) == 13 and all(ec_areas.AREAS[p] for p in provs), provs)
+names = [a[0] for areas in ec_areas.AREAS.values() for a in areas]
+ok("area names are unique and each has a centre in Canada", len(names) == len(set(names))
+   and all(41 < a[1] < 84 and -142 < a[2] < -52 for areas in ec_areas.AREAS.values() for a in areas))
+ok("the three original BC regions are there and are the default", all(ec_areas.find(n) and ec_areas.find(n)[0] == "British Columbia" for n in ec_areas.DEFAULT_AREAS))
+
+ok("alert kinds read like the per-zone feeds", ec_areas.kind_of({"alert_type": "warning", "risk_colour_en": "yellow", "alert_short_name_en": "Snowfall"})
+   == "YELLOW WARNING - SNOWFALL" and ec_areas.kind_of({"alert_type": "statement", "alert_short_name_en": "Special weather"}) == "SPECIAL WEATHER STATEMENT"
+   and ec_areas.kind_of({"alert_type": "advisory", "risk_colour_en": "yellow", "alert_short_name_en": "Frost (advisory)"}) == "YELLOW ADVISORY - FROST")
+asked = []
+def fake(url, params):
+    asked.append(params["bbox"])
+    return {"features": [{"properties": {"alert_type": "warning", "risk_colour_en": "yellow", "alert_short_name_en": "Snowfall", "status_en": "issued"}},
+                         {"properties": {"alert_type": "warning", "risk_colour_en": "yellow", "alert_short_name_en": "Snowfall", "status_en": "continued"}},
+                         {"properties": {"alert_type": "advisory", "risk_colour_en": "yellow", "alert_short_name_en": "Frost (advisory)", "status_en": "ended"}}]}
+got = ec_areas.alerts_near(51.05, -114.07, get=fake)
+ok("an area's alerts: the ones in force around its centre, each kind once, ended ones left out", got == {"YELLOW WARNING - SNOWFALL"}, got)
+ok("...asked for about 50 km around the centre", asked == ["-114.42,50.8,-113.72,51.3"], asked)
+
+ea.set_weather_areas(["Lower Mainland", "Greater Calgary", "Not an area"])
+ok("chosen areas are watched; the original BC regions keep their own feeds", list(ea.WEATHER_LOCATIONS) == ["Lower Mainland", "Greater Calgary"]
+   and ea.WEATHER_LOCATIONS["Lower Mainland"]["feeds"] and ea.WEATHER_LOCATIONS["Greater Calgary"]["feeds"] is None)
+ea.set_weather_areas([])
+ok("nothing chosen: the three original regions, as before", list(ea.WEATHER_LOCATIONS) == ec_areas.DEFAULT_AREAS)
+
+# a scan with a new area: its warning becomes a 'Weather Warning: <area>' like the BC ones (to #weather)
+ea.set_weather_areas(["Greater Calgary"])
+seen = {}
+async def collect(cur, state, skip=None): seen.update(cur)
+with mock.patch.object(ec_areas, "alerts_near", lambda lat, lon: {"YELLOW WARNING - SNOWFALL"}), mock.patch.object(ea, "process_scraped_alerts", collect):
+    asyncio.run(ea.scrape_weather_warnings())
+ok("a new area's warning comes out like the BC ones: 'Weather Warning: Greater Calgary'",
+   seen == {"EC_REGION_Greater Calgary_YELLOW WARNING - SNOWFALL": ("Weather Warning: Greater Calgary", "YELLOW WARNING - SNOWFALL", "")}, seen)
+ea.set_weather_areas([])
+
+# the settings tab: province, then area
+import mcIRC
+from gui_addons import AddonAPI
+root = tk.Tk()
+app = mcIRC.App(root, demo=True); root.update()
+app.save = lambda: None
+spec = importlib.util.spec_from_file_location("t_ba", os.path.join(ROOT, "packages", "broadcast_alerts", "broadcast_alerts.py"))
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+api = AddonAPI(app, "broadcast_alerts"); bot = mod.Addon(api)
+page = bot.build_options(tk.Frame(root)); root.update()
+ok("the 'Weather areas' tab starts with the three original regions ticked", sum(v.get() for v in bot.area_vars.values()) == 3
+   and all(bot.area_vars[n].get() for n in ec_areas.DEFAULT_AREAS))
+bot.area_vars["Greater Calgary"].set(True); bot.area_vars["Sunshine Coast"].set(False)
+with mock.patch.object(bot, "_mode_changed", lambda: None), mock.patch.object(bot, "_refresh_button", lambda: None):
+    bot.apply_options()
+ok("ticks in any province are saved and watched", set(api.get("weather_areas")) == {"Lower Mainland", "Vancouver Island", "Greater Calgary"}
+   and set(ea.WEATHER_LOCATIONS) == {"Lower Mainland", "Vancouver Island", "Greater Calgary"}, api.get("weather_areas"))
+ea.set_weather_areas([])
+# ---- more than one channel per kind (Channels tab)
+import meshcore_io as _io
+sent = []
+with mock.patch.object(ea, "execute_mesh_command", lambda args, **k: sent.append(tuple(args[-3:-1]))), \
+        mock.patch.object(ea, "_emit", lambda *a, **k: None), mock.patch.object(ea.time, "sleep", lambda s: None), \
+        mock.patch.object(_io, "CONNECTION_ARGS", ["x"]), mock.patch.dict(_io.CHANNEL_INDEX_BY_NAME, {"#drivebc": 2, "#weather": 4, "#mcirc": 10, "Public": 0}, clear=True), \
+        mock.patch.dict(ea.TX, {"muted": False}), mock.patch.dict(ea.TX["sources"], {"Weather": True, "DriveBC": True}):
+    ea.CHANNEL_LISTS = {"Weather": ["weather", "mcirc", "public", "weather"]}
+    ea.broadcast_via_cli("Weather Warning: Lower Mainland", "SNOWFALL", "x")
+    ok("a weather warning goes to #weather and to the other channels listed - once each, never Public", sent == [("chan", "4"), ("chan", "10")], sent)
+    sent.clear(); ea.broadcast_via_cli("DriveBC", "Hwy 1", "crash")
+    ok("...other kinds keep their one channel", sent == [("chan", "2")], sent)
+    sent.clear(); ea.CHANNEL_LISTS = {"DriveBC": ["mcirc", "drivebc"]}; ea.broadcast_via_cli("DriveBC", "Hwy 1", "crash")
+    ok("...the first channel listed is the kind's own", sent == [("chan", "10"), ("chan", "2")], sent)
+    ea.CHANNEL_LISTS = {}
+spec = importlib.util.spec_from_file_location("t_ba_channels", os.path.join(ROOT, "packages", "broadcast_alerts", "broadcast_alerts.py"))
+ba = importlib.util.module_from_spec(spec); spec.loader.exec_module(ba)
+ok("the Channels tab reads 'one, two' lists (commas or spaces, # or not, each once, no Public)",
+   ba.split_channels("#weather, mcirc  Public #Weather") == ["weather", "mcirc"])
+# channels start blank for a new install (stations don't all post to the same channels); an install that was in use keeps its channels
+class FakeApi:
+    def __init__(self, store): self.s = dict(store); self.notes = []
+    def get(self, k, d=None): return self.s.get(k, d)
+    def set(self, k, v): self.s[k] = v
+    def notice(self, t, level="info"): self.notes.append(t)
+def applied(store):
+    b = ba.Addon.__new__(ba.Addon); b.api = FakeApi(store)
+    with mock.patch.object(ea, "set_weather_areas", lambda *a: None):
+        b.apply_settings()
+    return b, dict(ea.CHANNEL_LISTS)
+b, lists = applied({})
+ok("a new install: every channel blank - nothing is broadcast until the station chooses its own", all(v == [] for v in lists.values())
+   and set(lists) == set(ba.CHANNEL_KINDS) and all(v == "" for v in b.api.s["channel_lists"].values()), lists)
+b, lists = applied({"muted": False, "sources": {"DriveBC": True}, "channel_lists": {}})
+ok("an install that was in use keeps the channels it broadcast to (1.4 saved '{}' for 'all built-in')", lists["DriveBC"] == ["drivebc"]
+   and lists["Weather"] == ["weather"] and lists["TransLink"] == ["translink"], lists)
+b, lists = applied({"muted": False, "channel_lists": {"Weather": "#weather, #mcirc"}})
+ok("...and its own changes", lists["Weather"] == ["weather", "mcirc"] and lists["DriveBC"] == ["drivebc"], lists)
+b, lists = applied({"muted": False, "channels_v2": True, "channel_lists": {"DriveBC": "", "Weather": "#wx-mygroup"}})
+ok("...a box emptied later stays empty", lists["DriveBC"] == [] and lists["Weather"] == ["wx-mygroup"], lists)
+sent = []
+with mock.patch.object(ea, "execute_mesh_command", lambda args, **k: sent.append(tuple(args[-3:-1]))), \
+        mock.patch.object(ea, "_emit", lambda *a, **k: None), mock.patch.object(_io, "CONNECTION_ARGS", ["x"]), \
+        mock.patch.dict(_io.CHANNEL_INDEX_BY_NAME, {"#drivebc": 2, "Public": 0}, clear=True), \
+        mock.patch.dict(ea.TX, {"muted": False}), mock.patch.dict(ea.TX["sources"], {"DriveBC": True}):
+    ea.CHANNEL_LISTS = {"DriveBC": []}
+    ea.broadcast_via_cli("DriveBC", "Hwy 1", "crash")
+ok("a kind with no channel chosen is not broadcast - never to Public, never to the old built-in channel", sent == [], sent)
+ea.CHANNEL_LISTS = {}
+root.destroy()
+import importlib, logging
+before = len(logging.getLogger('').handlers)
+importlib.reload(ea); importlib.reload(ea)
+ok("the engine reloaded (addon updated) doesn't write every log line twice", len(logging.getLogger('').handlers) == before,
+   (before, len(logging.getLogger('').handlers)))
+print("\nALL PASSED" if not fails else f"\n{len(fails)} FAILED: {fails}")
+sys.exit(1 if fails else 0)

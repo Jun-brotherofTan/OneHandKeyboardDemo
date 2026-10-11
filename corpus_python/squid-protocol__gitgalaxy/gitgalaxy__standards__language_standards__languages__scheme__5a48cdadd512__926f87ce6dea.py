@@ -1,0 +1,383 @@
+# ==============================================================================
+# GitGalaxy
+# Copyright (c) 2026 Joe Esquibel
+#
+# This source code is licensed under the PolyForm Noncommercial License 1.0.0.
+# You may not use this file except in compliance with the License.
+# A copy of the license can be found in the LICENSE file in the root directory
+# of this project, or at https://polyformproject.org/licenses/noncommercial/1.0.0/
+# ==============================================================================
+
+from typing import Any
+
+from gitgalaxy.standards.language_standards import _lazy_re as re  # #3914: compiled on first use
+from gitgalaxy.standards.language_standards.identifiers import ID_CONTINUE
+
+from .._shared_patterns import CALLS_OUT_LISP_FAMILY, GLOBAL_FRAGILE_DEBT, GLOBAL_PLANNED_DEBT
+
+DEFINITION: dict[str, Any] = {
+    "_meta": {
+        "target_version": "R5RS / R6RS / Guile (GnuPG gpgscm)",
+        "last_updated": "2026-03-11",
+        "blueprint_version": "",
+        "status": "production",
+    },
+    # COMPREHENSIVE SURFACE AREA: Standard Scheme, legacy PLT/Chez suffixes, and Racket sources.
+    "extensions": [".scm", ".ss", ".rkt", ".sch", ".sld", ".sls", ".sps"],
+    # ABSOLUTE IDENTITY & EXACT FILENAMES: Scheme rarely uses extensionless configurations.
+    "exact_matches": [],
+    # ECOSYSTEM ANCHORS & DISAMBIGUATION: Guile build definitions, Racket manifests, and Lisp package formats.
+    "discriminators": [".scm", ".rkt", "info.rkt", "guix.scm"],
+    # EXECUTION SIGNATURES: Interpreters found on Line 1 for shell wrappers invoking Scheme/Guile/Racket.
+    "shebangs": ["guile", "scheme", "csi", "racket", "racketsh"],
+    # BUG FIX (#770): this comment always described a genuine nested
+    # block-comment family ("Perfectly captures the Lisp ecosystem's
+    # reliance on ';' for line-level comments and `#| |#` for nested
+    # block-level Commented / Non-Executable Text"), but the field itself
+    # was left at "line_exclusive" -- which has NO cross-line state at
+    # all (per how_to_add_a_language.md: "no native multi-line block
+    # syntax; the engine ignores closing tags"), the literal opposite of
+    # what this comment claims. Confirmed empirically: a real multi-line
+    # `#| ... |#` block only had its first line recognized as a comment;
+    # every subsequent line up to and including the closing `|#` leaked
+    # into code_stream as live code. Fixed by actually creating the
+    # dedicated family (recursive_block_lisp), reusing the same
+    # iterative-peel algorithm recursive_block_haskell already uses for
+    # {- -}, just with Scheme's own ; / #| / |# tokens.
+    "lexical_family": "recursive_block_lisp",
+    "rules": {
+        # Epic #3264: Explicitly declare the structural invocation paradigm
+        "calls_out": CALLS_OUT_LISP_FAMILY,
+        "_calls_out_ignore": frozenset(
+            {
+                "define",
+                "cond",
+                "lambda",
+                "quote",
+                "begin",
+                "let",
+                "when",
+                "unless",
+                "do",
+                "and",
+                "or",
+                "case",
+                "else",
+                "delay",
+                "export",
+                "define-syntax",
+                "syntax-rules",
+                "set!",
+                # #3359 (contract C2): keywords and special forms, never calls
+                "let*",
+                "letrec",
+                "letrec*",
+                "let-values",
+                "let*-values",
+                "define-values",
+                "define-record-type",
+                "case-lambda",
+                "syntax-case",
+                "with-syntax",
+                "let-syntax",
+                "letrec-syntax",
+                "parameterize",
+                "fluid-let",
+                "guard",
+                "quasiquote",
+                "unquote",
+                "unquote-splicing",
+                "delay-force",
+                "fields",
+                "mutable",
+                "immutable",
+                "sealed",
+                "opaque",
+                "protocol",
+                "nongenerative",
+            }
+        ),
+        # --- PHASE 1: LOGIC TOPOLOGY & STRUCTURE ---
+        # 1. branch (Control Flow / Branching)
+        # Lisp control flow branches. Uses custom S-expression boundaries.
+        "branch": re.compile(r"(?<![^ \t\n\r(\[])(if|cond|case|and|or|when|unless)(?![^ \t)\]\n\r])"),
+        # 2. args (Parameters / Coupling)
+        # Captures the parameter list inside a standard function definition: (define (func arg1 arg2) ...)
+        "args": re.compile(
+            # =====================================================================
+            # [ THE S-EXPRESSION ARGS SHIELD (SCHEME) ]
+            # Scheme arguments are inside the same parenthesis as the function name.
+            # FIX 1 (Pathological): Upgraded horizontal spaces to `[ \t\n]*` for vertical layouts.
+            # FIX 2 (Positive): The previous regex strictly required a space and arguments.
+            # Made the argument capture group `(?:[ \t\n]+[^)]*)?` optional so
+            # parameter-less functions like `(define (func))` cleanly pass.
+            # =====================================================================
+            # #1209: name and parameter-list span split into their own
+            # capture groups (was only reachable via group(0), the whole
+            # "(define (name arg1 arg2)" match including the "(define"
+            # prefix and function name) so detector.py's counter isolates
+            # just the space-separated parameter text -- the whole-match
+            # fallback whitespace-split "(define" and the name as
+            # spurious extra args on top of the real ones (the same
+            # overcount shape #1199 fixed for Python, just off by 2 here
+            # instead of 1 since Scheme has two prefix tokens, not one).
+            # REDOS FIX (found verifying #1209, pre-existing -- not
+            # introduced by the groups above): the name class
+            # `[^ \t\n()]+` and the trailing `[^)]*` are adjacent
+            # unbounded quantifiers over near-identical character
+            # classes (the second is a superset of the first), so an
+            # unterminated `(define (xxxx...` with no closing `)`
+            # anywhere made the engine give back the name one char at a
+            # time and re-scan the whole remaining run as the args span
+            # at each step -- O(n^2) confirmed via scaling sweep (247x
+            # time for 16x input). Bounding the name to a realistic
+            # identifier length caps the number of give-back steps to a
+            # constant, restoring linear behavior.
+            r"^[ \t\n]*\([ \t\n]*define[ \t\n]+\([ \t\n]*([^ \t\n()]{1,100})([^)]*)\)",
+            re.M,
+        ),
+        # 3. linear (Sequential Boundaries)
+        # Structural boundaries defining scope and sequential execution.
+        "structural_boundaries": re.compile(r"(?<![^ \t\n\r(\[])(let|let\*|letrec|letrec\*|begin|do)(?![^ \t)\]\n\r])"),
+        # 4. func_start (Executable Logic Anchors)
+        # Anchors logic blocks. Captures the function name immediately following the parenthesis.
+        # BUG FIX: the identifier capture class `[a-zA-Z0-9_!?-]+` excluded
+        # `> < = * + / . ~ $ % ^ &` -- but real Scheme identifiers are
+        # extremely permissive (R7RS special-initial/special-subsequent
+        # chars), and the "X->Y" type-conversion naming convention
+        # (`list->vector`, `string->number`, ...) is idiomatic in the
+        # standard library itself. The truncated capture broke the
+        # following lookahead entirely, so func_start silently failed to
+        # match ANY such definition (`1+`, `foo*`, `list->vector`, etc.),
+        # not just a partial-name capture. Widened to the realistic set.
+        "func_start": re.compile(
+            # =====================================================================
+            # [ THE S-EXPRESSION SHIELD (SCHEME/LISP) ]
+            # S-expressions format heavily around parentheses, often pushing the
+            # `define`, the inner parenthesis `(`, and the identifier onto separate lines.
+            # FIX: Replaced `\s+` and `\s*` with `[ \t\n]+` and `[ \t\n]*` inside
+            # the S-expression structure to ensure the parser can track the
+            # identifier no matter how deeply it is vertically nested.
+            # =====================================================================
+            r"^[ \t\n]*\([ \t\n]*define[ \t\n]+\([ \t\n]*([" + ID_CONTINUE + r"!?*+/<>=.~$%^&:-]+)(?![^ \t\n)\]\r])",
+            re.M,
+        ),
+        # 5. class_start (Object / Entity Declarations)
+        # Scheme lacks traditional objects; SRFI-9 Records serve as structural entities.
+        # BUG FIX: same identifier-capture defect as func_start above --
+        # missed the extremely common `<TypeName>` angle-bracket naming
+        # convention for record types (SRFI-9/R6RS idiom, e.g. `<point>`).
+        "class_start": re.compile(
+            r"^[ \t\n]*\([ \t\n]*define-record-type[ \t\n]+(?:\([ \t\n]*)?(["
+            + ID_CONTINUE
+            + r"!?*+/<>=.~$%^&:-]+)(?![^ \t\n)\]\r])",
+            re.M,
+        ),
+        # --- PHASE 2: RISK & STRUCTURAL INTEGRITY ---
+        # 6. safety (Defensive Programming / Validation)
+        # Continuations, exception guards, and dynamic-wind state protectors.
+        "safety": re.compile(
+            r"(?<![^ \t\n\r(\[])(guard|dynamic-wind|with-exception-handler|call-with-current-continuation|call/cc|assert|check)(?![^ \t)\]\n\r])"
+        ),
+        # 7. safety_neg (Safety Bypasses / Unchecked Types)
+        # Explicit, raw manipulation of cons cells or unrestricted environments.
+        "safety_bypasses": re.compile(
+            r"(?<![^ \t\n\r(\[])(set-car!|set-cdr!|interaction-environment)(?![^ \t)\]\n\r])"
+        ),
+        # 8. danger (High-Risk Execution / System Calls)
+        # Dynamic code execution and emergency system exits.
+        "high_risk_execution": re.compile(r"(?<![^ \t\n\r(\[])(eval|exit|emergency-exit|quit)(?![^ \t)\]\n\r])"),
+        # 9. io (I/O & Network Boundaries)
+        # File operations and output ports.
+        "io": re.compile(
+            r"(?<![^ \t\n\r(\[])(open-input-file|open-output-file|read|read-char|write|display|newline|call-with-input-file|call-with-output-file|load|format)(?![^ \t)\]\n\r])"
+        ),
+        # 10. api (Public Surface Area)
+        # Module exports defining the public surface.
+        "api": re.compile(r"^[ \t]*\([ \t]*(?:export|define-public)(?![^ \t)\]\n\r])", re.M),
+        # #2823: the plural form of #2774's `_visibility_export`. Naming a
+        # function in an export statement is a visibility DECLARATION, not a
+        # use, and `unreferenced_by_name`'s corollary 2 says a declaration must
+        # not clear the flag. Scheme never got one of #2774's five rules, so 12
+        # of its 13 keyword-rosetta probe functions read as REFERENCED with
+        # nothing calling any of them (0.25 unreferenced per file against a 2.50
+        # corpus median), each cleared by its own `(export probe-globals)`.
+        #
+        # The list form rather than the singular one because both of Scheme's
+        # export constructs take an arbitrary number of names in one clause: the
+        # R7RS `(export a b c)` inside a `define-library`, and Guile's
+        # `#:export (a b c)` inside a `define-module`. Group 1 or group 2 is the
+        # clause's contents; detector.py records the start offset of each name
+        # token in it. Both arms exclude nested parens, so a renaming export
+        # (`(export (rename internal external))`) is deliberately not matched --
+        # the name in it is not the one the definition writes.
+        "_visibility_export_list": re.compile(
+            r"\([ \t]*export[ \t\r\n]+([^()]*)\)|#:export[ \t\r\n]*\(([^()]*)\)",
+            re.M,
+        ),
+        # 11. flux (State Mutation)
+        # Mutation of state. In Scheme, all mutating functions end with a bang (!).
+        "state_mutation": re.compile(
+            # #2765 contract: a `set!`-family form in operator position writes.
+            r"(?<![^ \t\n\r(\[])(set!|vector-set!|string-set!|hash-table-set!|hashtable-set!|bytevector-u8-set!|set-box!|list-set!|vector-fill!)(?![^ \t)\]\n\r])"
+        ),
+        # 12. dead_code (Commented Logic / Deprecated Trails)
+        # Commented out S-expressions.
+        "dead_code": re.compile(
+            r"^[ \t]*;+[ \t]*\([ \t]*(?:define|let|if|cond|lambda)(?![^ \t)\]\n\r])",
+            re.M,
+        ),
+        # 13. doc (Structured Documentation)
+        # Scheme documentation standards (triple semicolons or texinfo).
+        "doc": re.compile(r"^[ \t]*;;;|^[ \t]*;[ \t]*@(?:param|return|author)", re.M),
+        # 14. test (Testing & Assertions)
+        # SRFI-64 and Guile testing frameworks (essential for mapping gpgscm tests).
+        "test": re.compile(
+            r"(?<=\()(test-begin|test-end|test-assert|test-eqv|test-equal|test-eq|check-equal\?|check-true|test)(?![^ \t)\]\n\r])"
+        ),
+        # --- PHASE 3: ARCHITECTURE & DOMAIN SENSORS ---
+        # 15. concurrency (Asynchronous Execution)
+        # SRFI-18 Multithreading primitives.
+        "concurrency": re.compile(
+            r"(?<![^ \t\n\r(\[])(make-thread|thread-start!|thread-yield!|mutex-lock!|mutex-unlock!|condition-variable-signal!)(?![^ \t)\]\n\r])"
+        ),
+        # 16. ui_framework
+        "ui_framework": None,
+        # 17. closures (Closures / Anonymous Functions)
+        # Anonymous function depth.
+        "closures": re.compile(r"(?<![^ \t\n\r(\[])lambda(?![^ \t)\]\n\r])"),
+        # 18. globals (Global / Shared State)
+        # Top-level state bindings (defines that are NOT functions).
+        # BUG FIX: same identifier-class defect as func_start/class_start --
+        # a top-level binding using the "X->Y" convention (e.g.
+        # `default->value`) failed to match at all.
+        "globals": re.compile(r"^[ \t]*\([ \t]*define\s+[" + ID_CONTINUE + r"!?*+/<>=.~$%^&:-]+\s+[^(\s]", re.M),
+        # #2674: the regex above matches BOTH a module-level `(define x v)` (a
+        # real global) and an internal define inside a lambda/let/procedure
+        # body (a local binding, R7RS 5.3.2) -- and in Scheme indentation
+        # doesn't separate them: the whole of Chez's cpnanopass.ss sits inside
+        # a `(let () ...)` wrapper, so its 682 defines are ALL indented and
+        # the #2651 column-0 anchor would have zeroed them. Measured over the
+        # language-crucible Chez/Racket sources the bare regex is 42.7%
+        # precise (53 globals / 71 locals). The discriminator is the
+        # ENCLOSING FORM, which no flat pattern can see, so detector.py's
+        # coding_analysis runs a paren-depth scope pass over the segment and
+        # keeps only the matches whose define is module-level (top level,
+        # `library`/`module`/`define-library`, or a bindings-less let-family
+        # file wrapper). See `_lisp_module_level_define_offsets` in
+        # detector.py; on the same corpus it keeps 53 / drops 71.
+        "_scope_filters": {"globals": "lisp_body_position"},
+        # 19. decorators
+        "decorators": None,
+        # 20. generics
+        "generics": None,
+        # 21. comprehensions (Iterators / Comprehensions)
+        # Functional list operations (SRFI-1).
+        "comprehensions": re.compile(
+            r"(?<![^ \t\n\r(\[])(map|for-each|filter|fold|reduce|fold-right|fold-left)(?![^ \t)\]\n\r])"
+        ),
+        # 22. scientific (Numerical / Compute Libraries)
+        # Scheme's native mathematical tower.
+        # #2899: anchored to head (operator) position -- directly after `(`/`[` -- so
+        # `exp` as a field/variable name in operand position no longer counts.
+        "scientific": re.compile(
+            r"(?<=[(\[])(sin|cos|tan|asin|acos|atan|exp|log|sqrt|expt|abs|gcd|lcm|numerator|denominator|floor|ceiling|truncate|round|exact->inexact)(?![^ \t)\]\n\r])"
+        ),
+        # 23. heat_triggers (Metaprogramming & Reflection)
+        # Metaprogramming and syntactic abstractions.
+        "reflection_metaprogramming": re.compile(
+            r"(?<![^ \t\n\r(\[])(define-macro|define-syntax|syntax-rules|syntax-case|let-syntax|letrec-syntax)(?![^ \t)\]\n\r])"
+        ),
+        # 24. import (Dependency Inclusions)
+        # Scheme module resolution dependencies.
+        "import": re.compile(r"^[ \t]*\([ \t]*(?:import|use-modules|require)(?![^ \t)\]\n\r])", re.M),
+        # BUG FIX (#2652): added _dependency_capture to support DAG edge creation.
+        # Handles both the rosetta corpus's bare `(import a)` form and real R7RS
+        # `(import (scheme base))` / Guile `(use-modules (ice-9 popen))` library-list
+        # forms; captures the last path component / module name as the DAG resolver
+        # expects. The optional leading `\(?` and bounded `{0,6}` component repeat
+        # keep this ReDoS-safe (no nested unbounded quantifiers).
+        "_dependency_capture": re.compile(
+            r"^[ \t]*\([ \t\n]*(?:import|use-modules|require)[ \t\n]+"
+            r"\(?[ \t\n]*(?:[" + ID_CONTINUE + r"!?*+/<>=.~$%^&:-]+[ \t\n]+){0,6}"
+            r"([" + ID_CONTINUE + r"!?*+/<>=.~$%^&:-]+)[ \t\n]*\)?[ \t\n]*\)",
+            re.M,
+        ),
+        # 25. ownership (Authorship Metadata)
+        # #2882 contract: C2 `Copyright:` out; `Authors:` joins
+        "ownership": re.compile(
+            r"^[ \t]*(?:;+|#\|)[ \t]*(?:Authors?|Created[ \t]+by|Maintainers?|Owners?|Developers?|Contact)[ \t]*:(?![:=])[ \t]*(\S[^\n]*?)[ \t]*(?:\*/|-->)?[ \t]*$|^[ \t]*(?-i:(?:Author|AUTHOR)(?:s|S)?|Created[ \t]+by|CREATED[ \t]+BY|Maintainer(?:s)?|MAINTAINER(?:S)?|Owner(?:s)?|OWNER(?:S)?|Developer(?:s)?|DEVELOPER(?:S)?|Contact|CONTACT)[ \t]*:(?![:=])[ \t]*(\S[^\n]*?)(?<![,;{(])[ \t]*(?:\*/|-->)?[ \t]*$|@author:?[ \t]+(\S[^\n]*?)[ \t]*(?:\*/|-->)?[ \t]*$",
+            re.I | re.M,
+        ),
+        # --- 🌌 PHASE 4: EXTENDED DIMENSIONS (Specialized Sub-Equations) ---
+        # 26. planned_debt
+        "planned_debt": GLOBAL_PLANNED_DEBT,
+        # 27. fragile_debt
+        "fragile_debt": GLOBAL_FRAGILE_DEBT,
+        # 29. spec_exposure
+        # BUG FIX: adjacent unbounded quantifiers with overlapping character
+        # sets (`\d+` immediately followed by `[^\]]*`, which also matches
+        # digits) -- the same ReDoS shape already found and fixed
+        # independently in embedded_python, css, tcl, and matlab earlier in
+        # this epic. Confirmed via scaling sweep (~4x per doubling before,
+        # ~linear after bounding both quantifiers).
+        "spec_exposure": re.compile(r"\[(?:\s*SPEC\s*-\s*\d{1,10}|spec|audit)[^\]]{0,300}\]", re.I),
+        # 31. ssr_boundaries
+        "ssr_boundaries": None,
+        # 32. events (Event Emitters / Pub-Sub)
+        # Hook paradigms common in Guile/Emacs environments.
+        "events": re.compile(r"(?<![^ \t\n\r(\[])(hook|add-hook!|run-hooks)(?![^ \t)\]\n\r])"),
+        # 33. dependency_injection
+        "dependency_injection": None,
+        # 34. macros (Preprocessor Directives / Macros)
+        "macros": re.compile(
+            r"(?<![^ \t\n\r(\[])(define-syntax|define-macro|syntax-rules|syntax-case)(?![^ \t)\]\n\r])"
+        ),
+        # 35. pointers
+        "pointers": None,
+        # 36. memory_alloc
+        # Explicit heap instantiations.
+        # #2898: contract-level absence. cons/list/make-* are all GC-managed allocation
+        # (cons alone was 150/file); the registry reads memory_alloc as UNMANAGED
+        # allocation only, and portable scheme has no unmanaged form.
+        "memory_alloc": None,
+        # 37. inline_asm
+        "inline_asm": None,
+        # --- PHASE 5: RESOURCE MANAGEMENT & STABILITY ---
+        # 38. telemetry (Structured Logging / Telemetry)
+        "telemetry": re.compile(r"(?<![^ \t\n\r(\[])(log-info|log-error|log-warn|log-debug|syslog)(?![^ \t)\]\n\r])"),
+        # 39. debug_prints (Debug Artifacts / Unstructured Outputs) (Standard Output / Debug Prints)
+        "debug_prints": re.compile(r"(?<![^ \t\n\r(\[])(display|write|newline|format\s+#t)(?![^ \t)\]\n\r])"),
+        # # 40. explicit_casts (Explicit Type Casting)
+        # Type coercions crossing memory boundaries.
+        "explicit_casts": re.compile(
+            r"(?<![^ \t\n\r(\[])(number->string|string->number|symbol->string|string->symbol|list->vector|vector->list|char->integer|integer->char)(?![^ \t)\]\n\r])"
+        ),
+        # 41. panics_and_aborts (Execution Interrupts / Fatal Aborts)
+        "panics_and_aborts": re.compile(r"(?<![^ \t\n\r(\[])(error|abort|exit|emergency-exit)(?![^ \t)\]\n\r])"),
+        # 42. thread_sleeps (Thread Blocking / Synchronous Pauses)
+        "thread_sleeps": re.compile(r"(?<![^ \t\n\r(\[])(sleep|usleep|thread-sleep!)(?![^ \t)\]\n\r])"),
+        # 43. bitwise_ops (Bitwise Operations)
+        "bitwise_ops": re.compile(
+            r"(?<![^ \t\n\r(\[])(bitwise-and|bitwise-ior|bitwise-xor|bitwise-not|arithmetic-shift|ash)(?![^ \t)\]\n\r])"
+        ),
+        # 44. sync_locks (Resource Management & Stability)
+        "sync_locks": re.compile(r"(?<![^ \t\n\r(\[])(mutex-lock!|make-mutex)(?![^ \t)\]\n\r])"),
+        # 45. immutability_locks (Immutability Constraints)
+        # Immutable strings and explicit quotations (meaning the list cannot be mutated safely).
+        "immutability_locks": re.compile(
+            r"(?<![^ \t\n\r(\[])(string->immutable-string)(?![^ \t)\]\n\r])"
+        ),  # #2772: a quote is the ordinary literal syntax (987 crucible hits were datum quotes); the explicit lock call stays
+        # 46. cleanup (Resource Cleanup / Teardown)
+        "cleanup": re.compile(
+            r"(?<=[(\[])[ \t]*(close-input-port|close-output-port|close-port)(?![^ \t)\]\n\r])"
+        ),  # #2888 C3: head position only; `(call-port-handler close-port ...)` passes the name
+        # 47. encapsulation (Access Modifiers / Encapsulation)
+        # Module-internal definitions.
+        "encapsulation": re.compile(r"^[ \t]*\([ \t]*define-private(?![^ \t)\]\n\r])", re.M),
+        # 48. listeners (Event Listeners / Observers)
+        "listeners": re.compile(r"(?<![^ \t\n\r(\[])(add-hook!)(?![^ \t)\]\n\r])"),
+        # 49. test_skip (Bypassed Tests / Ignored Specs)
+        "test_skip": re.compile(r"(?<![^ \t\n\r(\[])(test-skip|test-expect-fail)(?![^ \t)\]\n\r])"),
+    },
+}

@@ -9,8 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from corpus_files import list_corpus_files
+
 
 WORD_PATTERN = re.compile(r"\b[\w]+(?:['-][\w]+)*\b", re.UNICODE)
+LICENSE_HEADER_PATTERN = re.compile(
+    r"SPDX-License-Identifier|Copyright|Licensed under the|Apache License|MIT License|"
+    r"GNU Affero General Public License|GNU General Public License",
+    re.IGNORECASE,
+)
+PYTHON_ENCODING_PATTERN = re.compile(r"coding[:=]\s*[-\w.]+", re.IGNORECASE)
+MAX_HEADER_LINES = 80
 
 
 @dataclass(frozen=True)
@@ -35,20 +44,52 @@ class Candidate:
         }
 
 
-def read_corpus(path: str | Path) -> str:
-    """Read one .txt file or concatenate all .txt files in a directory."""
+def clean_python_license_header(text: str) -> str:
+    """Remove likely license comment blocks before the first Python code line."""
+    lines = text.splitlines(keepends=True)
+    header_end = 0
+    for line in lines[:MAX_HEADER_LINES]:
+        stripped = line.lstrip("\ufeff").lstrip()
+        if not stripped or stripped.startswith("#"):
+            header_end += 1
+            continue
+        break
+
+    header_comments = [
+        line for line in lines[:header_end] if line.lstrip("\ufeff").lstrip().startswith("#")
+    ]
+    if not LICENSE_HEADER_PATTERN.search("".join(header_comments)):
+        return text
+
+    preamble = []
+    for line in lines[:header_end]:
+        stripped = line.lstrip("\ufeff").lstrip()
+        if stripped.startswith("#!") or PYTHON_ENCODING_PATTERN.search(stripped):
+            preamble.append(line)
+    return "".join([*preamble, *lines[header_end:]])
+
+
+def read_corpus(path: str | Path, *, keep_license_headers: bool = False) -> str:
+    """Read .txt and .py files, cleaning likely license comments in Python headers."""
     source = Path(path)
+
+    def read_file(item: Path) -> str:
+        contents = item.read_text(encoding="utf-8")
+        if item.suffix.lower() == ".py" and not keep_license_headers:
+            return clean_python_license_header(contents)
+        return contents
+
     if source.is_file():
-        if source.suffix.lower() != ".txt":
-            raise ValueError(f"Input file must have a .txt extension: {source}")
-        return source.read_text(encoding="utf-8")
+        if source.suffix.lower() not in {".txt", ".py"}:
+            raise ValueError(f"Input file must have a .txt or .py extension: {source}")
+        return read_file(source)
     if source.is_dir():
-        files = sorted(
-            item for item in source.iterdir() if item.is_file() and item.suffix.lower() == ".txt"
+        files = list_corpus_files(
+            source, include_nested_txt=False, case_sensitive_txt=False
         )
         if not files:
-            raise ValueError(f"Directory contains no .txt files: {source}")
-        return "\n".join(item.read_text(encoding="utf-8") for item in files)
+            raise ValueError(f"Directory contains no .txt or .py files: {source}")
+        return "\n".join(read_file(item) for item in files)
     raise FileNotFoundError(f"Input path does not exist: {source}")
 
 
@@ -82,8 +123,25 @@ def _candidates(
 
 def _substring_counts(text: str, minimum_length: int, maximum_length: int) -> Counter[str]:
     counts: Counter[str] = Counter()
+    ascii_letters = [0] * (len(text) + 1)
+    forbidden_controls = [0] * (len(text) + 1)
+    for index, character in enumerate(text):
+        ascii_letters[index + 1] = ascii_letters[index] + int(
+            "a" <= character <= "z" or "A" <= character <= "Z"
+        )
+        forbidden_controls[index + 1] = forbidden_controls[index] + int(
+            character in "\n\r\t"
+        )
+
     for length in range(minimum_length, maximum_length + 1):
         for start in range(0, len(text) - length + 1):
+            end = start + length
+            if text[start].isspace():
+                continue
+            if ascii_letters[end] == ascii_letters[start]:
+                continue
+            if forbidden_controls[end] != forbidden_controls[start]:
+                continue
             counts[text[start : start + length]] += 1
     return counts
 
@@ -129,7 +187,9 @@ def analyze_text(
     )
 
 
-def analyze_path(path: str | Path, **kwargs: int) -> tuple[list[Candidate], list[Candidate]]:
+def analyze_path(
+    path: str | Path, **kwargs: int | bool
+) -> tuple[list[Candidate], list[Candidate]]:
     return analyze_text(read_corpus(path), **kwargs)
 
 

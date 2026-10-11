@@ -3,19 +3,37 @@
 import argparse
 
 from corpus_analyzer import analyze_text, format_table, read_corpus, write_csv
-from shortcut_optimizer import format_optimization, optimize_shortcuts, write_selected_csv
+from shortcut_optimizer import (
+    format_optimization,
+    limit_optimizer_candidates,
+    optimize_shortcuts,
+    write_selected_csv,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", help="a .txt file or a directory containing .txt files")
+    parser.add_argument(
+        "input", help="a .txt or .py file or a directory containing .txt and .py files"
+    )
     parser.add_argument("--csv", required=True, help="output CSV path")
     parser.add_argument("--min-frequency", type=int, default=2)
     parser.add_argument("--min-length", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=10)
     parser.add_argument("--shortcut-cost", type=int, default=2)
+    parser.add_argument(
+        "--keep-license-headers",
+        action="store_true",
+        help="include Python license/header comments in corpus analysis",
+    )
     parser.add_argument("--top", type=int, default=100, help="number of results per table")
     parser.add_argument("--num-shortcuts", type=int, default=20)
+    parser.add_argument(
+        "--max-optimizer-candidates",
+        type=int,
+        default=1000,
+        help="maximum unique candidates evaluated by greedy optimization",
+    )
     parser.add_argument(
         "--selected-csv", default="selected_shortcuts.csv", help="CSV path for selected shortcuts"
     )
@@ -24,7 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    text = read_corpus(args.input)
+    if args.max_optimizer_candidates < 1:
+        build_parser().error("--max-optimizer-candidates must be at least 1")
+    text = read_corpus(args.input, keep_license_headers=args.keep_license_headers)
     substring_candidates, word_candidates = analyze_text(
         text,
         minimum_frequency=args.min_frequency,
@@ -37,11 +57,19 @@ def main() -> None:
     print()
     print(format_table("WORD CANDIDATES", word_candidates))
     write_csv(args.csv, substring_candidates, word_candidates)
+    optimizer_candidates = limit_optimizer_candidates(
+        [*substring_candidates, *word_candidates], args.max_optimizer_candidates
+    )
+    print(
+        f"Optimizer candidate pool: {len(optimizer_candidates)} "
+        f"(limit {args.max_optimizer_candidates})"
+    )
     result = optimize_shortcuts(
         text,
-        [*substring_candidates, *word_candidates],
+        optimizer_candidates,
         num_shortcuts=args.num_shortcuts,
         shortcut_cost=args.shortcut_cost,
+        progress_callback=lambda message: print(message, flush=True),
     )
     print()
     print(format_optimization(result))

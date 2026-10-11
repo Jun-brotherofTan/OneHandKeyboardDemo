@@ -1,0 +1,21 @@
+selection_order,shortcut,marginal_keystrokes_saved,cumulative_keystrokes_saved
+1,self.,5775,5775
+2,import ,3770,9545
+3,return ,3035,12580
+4,name,2662,15242
+5,data,2404,17646
+6,token,2379,20025
+7,result,2232,22257
+8,status_code,2187,24444
+9,tion,2092,26536
+10,.append(,1950,28486
+11,s = ,1752,30238
+12,for ,1722,31960
+13,"(self, ",1700,33660
+14,namespace,1660,35320
+15,from ,1653,36973
+16,container,1617,38590
+17,def ,1524,40114
+18,if ,1485,41599
+19,args.,1446,43045
+20,model,1443,44488

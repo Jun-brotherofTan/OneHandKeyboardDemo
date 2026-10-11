@@ -1,0 +1,258 @@
+# Copyright (c) 2020 Vlsarro
+# Copyright (c) 2013 Calin Crisan
+# This file is part of motionEye.
+#
+# motionEye is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import annotations
+
+import logging
+from asyncio import get_running_loop
+from os.path import join
+from pathlib import Path
+
+from tornado.web import HTTPError
+
+from motioneye import config, mediafiles, remote, settings, utils
+from motioneye.handlers.base import BaseHandler
+
+__all__ = ('MovieHandler',)
+
+
+class MovieHandler(BaseHandler):
+    async def get(self, camera_id: str, op, filename: str | None = None):
+        camera_id = int(camera_id)  # type: ignore[assignment]
+        if camera_id not in config.get_camera_ids():
+            raise HTTPError(404, 'no such camera')
+
+        camera_config: dict = config.get_camera(camera_id)
+        utils.validate_paths(
+            filename,
+            target_dir=(
+                camera_config['target_dir']
+                if utils.is_local_motion_camera(camera_config)
+                else None
+            ),
+        )
+
+        # block access to admin-only cameras for non-admin users
+        if camera_config.get('@admin_only') and self.current_user not in [
+            'admin',
+            'peer',
+        ]:
+            raise HTTPError(
+                403,
+                f'GET access denied to admin-only camera "{camera_id}" for operation "{op}"',
+            )
+
+        if op == 'list':
+            await self.list(camera_id)
+            return
+
+        elif op == 'preview':
+            await self.preview(camera_id, filename)
+            return
+
+        else:
+            raise HTTPError(400, 'unknown operation')
+
+    async def post(
+        self,
+        camera_id: str,
+        op,
+        filename: str | None = None,
+        group: str | None = None,
+    ):
+        camera_id = int(camera_id)  # type: ignore[assignment]
+        if camera_id not in config.get_camera_ids():
+            raise HTTPError(404, 'no such camera')
+
+        if group == '/':  # ungrouped
+            group = ''
+
+        camera_config: dict = config.get_camera(camera_id)
+        utils.validate_paths(
+            filename,
+            group,
+            target_dir=(
+                camera_config['target_dir']
+                if utils.is_local_motion_camera(camera_config)
+                else None
+            ),
+        )
+
+        # block access to admin-only cameras for non-admin users
+        if camera_config.get('@admin_only') and self.current_user not in [
+            'admin',
+            'peer',
+        ]:
+            raise HTTPError(
+                403,
+                f'POST access denied to admin-only camera "{camera_id}" for operation "{op}"',
+            )
+
+        if op == 'delete':
+            await self.delete(camera_id, filename)
+            return
+
+        elif op == 'delete_all':
+            await self.delete_all(camera_id, group)
+            return
+
+        else:
+            raise HTTPError(400, 'unknown operation')
+
+    @BaseHandler.auth()
+    @BaseHandler.peer_allowed()
+    async def list(self, camera_id):
+        logging.debug(f'listing movies for camera {camera_id}')
+
+        camera_config = config.get_camera(camera_id)
+        if utils.is_local_motion_camera(camera_config):
+            # Get with_stat parameter from query string, default to True
+            # Only 'false' is treated as false, everything else is true
+            with_stat = self.get_argument('with_stat', 'true').lower() != 'false'
+
+            media_list = await mediafiles.list_media(
+                camera_config,
+                media_type='movie',
+                prefix=self.get_argument('prefix', None),
+                with_stat=with_stat,
+            )
+            if media_list is None:
+                return self.finish_json({'error': 'Failed to get movies list.'})
+
+            return self.finish_json(
+                {'mediaList': media_list, 'cameraName': camera_config['camera_name']}
+            )
+
+        elif utils.is_remote_camera(camera_config):
+            resp = await remote.list_media(
+                camera_config,
+                media_type='movie',
+                prefix=self.get_argument('prefix', None),
+            )
+            if resp.error:
+                return self.finish_json(
+                    {
+                        'error': f'failed to get movie list for {remote.pretty_camera_url(camera_config)}: {resp.error}'
+                    }
+                )
+
+            return self.finish_json(resp.media_list)
+
+        else:  # assuming simple mjpeg camera
+            raise HTTPError(400, 'unknown operation')
+
+    @BaseHandler.auth()
+    @BaseHandler.peer_allowed()
+    async def preview(self, camera_id, filename):
+        logging.debug(f'previewing movie {filename} of camera {camera_id}')
+
+        camera_config = config.get_camera(camera_id)
+        if utils.is_local_motion_camera(camera_config):
+            content = mediafiles.get_media_preview(
+                camera_config,
+                filename,
+                'movie',
+                width=self.get_argument('width', None),
+                height=self.get_argument('height', None),
+            )
+
+        elif utils.is_remote_camera(camera_config):
+            resp = await remote.get_media_preview(
+                camera_config,
+                filename,
+                'movie',
+                width=self.get_argument('width', None),
+                height=self.get_argument('height', None),
+            )
+            content = resp.result
+
+        else:  # assuming simple mjpeg camera
+            raise HTTPError(400, 'unknown operation')
+
+        if content:
+            self.set_header('Content-Type', 'image/jpeg')
+
+        else:
+            self.set_header('Content-Type', 'image/svg+xml')
+            content = await get_running_loop().run_in_executor(
+                None,
+                Path(join(settings.STATIC_PATH, 'img', 'no-preview.svg')).read_bytes,
+            )
+
+        return self.finish(content)
+
+    @BaseHandler.auth(admin=True)
+    @BaseHandler.peer_allowed()
+    async def delete(self, camera_id, filename):
+        logging.debug(f'deleting movie {filename} of camera {camera_id}')
+
+        camera_config = config.get_camera(camera_id)
+        if utils.is_local_motion_camera(camera_config):
+            try:
+                mediafiles.del_media_content(camera_config, filename)
+                return self.finish_json()
+
+            except Exception as e:
+                return self.finish_json({'error': str(e)})
+
+        elif utils.is_remote_camera(camera_config):
+            resp = await remote.del_media_content(
+                camera_config, filename=filename, media_type='movie'
+            )
+            if resp.error:
+                return self.finish_json(
+                    {
+                        'error': f'failed to delete movie from {remote.pretty_camera_url(camera_config)}: {resp.error}'
+                    }
+                )
+
+            return self.finish_json()
+
+        else:  # assuming simple mjpeg camera
+            raise HTTPError(400, 'unknown operation')
+
+    @BaseHandler.auth(admin=True)
+    @BaseHandler.peer_allowed()
+    async def delete_all(self, camera_id, group):
+        logging.debug(
+            f'deleting movie group "{group or "ungrouped"}" of camera {camera_id}'
+        )
+
+        camera_config = config.get_camera(camera_id)
+        if utils.is_local_motion_camera(camera_config):
+            try:
+                mediafiles.del_media_group(camera_config, group, 'movie')
+                return self.finish_json()
+
+            except Exception as e:
+                return self.finish_json({'error': str(e)})
+
+        elif utils.is_remote_camera(camera_config):
+            resp = await remote.del_media_group(
+                camera_config, group=group, media_type='movie'
+            )
+            if resp.error:
+                return self.finish_json(
+                    {
+                        'error': f'failed to delete movie group at {remote.pretty_camera_url(camera_config)}: {resp.error}'
+                    }
+                )
+
+            return self.finish_json()
+
+        else:  # assuming simple mjpeg camera
+            raise HTTPError(400, 'unknown operation')

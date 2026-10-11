@@ -1,0 +1,988 @@
+#!/usr/bin/env python3
+"""Reproducibly patch only the audited Q2 V1.32 ZIP. Requires LLVM and squashfs-tools, and ImageMagick for --ipod.
+
+--logo swaps the boot splash JPEG (320x375); it defaults to assets/boot-logo.jpg.
+"""
+import argparse, hashlib, io, json, pathlib, re, shlex, struct, subprocess, tarfile, zipfile
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+ZIP_SHA = '154c17822d09be001be35c03d2d3488424dee195221790bd70864480d55b0f00'
+DEMO_SHA = '2c5f06142850b4fc168f82b44a81550cce0a5b4b9fe1c179dced4a08a3049138'
+VERSION = '1.1.2'  # major.minor.patch, single digits, shown as is (About, release tag and ZIPs)
+# The updater's identity (firmware_v20.info and demo's version literal) must be 5 characters and
+# differ from the installed one, so it packs the digits: 1.0.1 is V101I. About shows the stock
+# firmware version and a CFW. Version row with VERSION and the edition instead (ringnav_about).
+TAG = 'V' + VERSION.replace('.', '')
+VERSIONS = {'stock': TAG + 'S', 'ipod': TAG + 'I'}
+
+def dev_tag(number, edition):
+    """--dev build number's tag: V and three base-36 digits, the edition lowercase (V00Ai), so no
+    two test builds share a tag, and none equals a release's, and the updater takes each."""
+    digits, n = '', (number - 1) % (36**3 - 1) + 1  # 1..ZZZ, then round again
+    for _ in range(3): n, d = divmod(n, 36); digits = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'[d] + digits
+    return 'V' + digits + edition.lower()
+BASE = 0xb00000
+SCRATCH = 0xb40000
+RING_STEP = 48
+HOOKS = {
+    'on_wm_keyup_before_fun': (0x4e85c8, 'ringnav'),
+    'on_wm_tsdown_before_fun': (0x4e8bd0, 'ringnav_touch'),
+    'widget_on_paint_border': (0x6596a0, 'ringnav_paint'),
+    'widget_dispatch': (0x65e0ec, 'ringnav_dispatch'),
+    'on_wm_keylong_fun': (0x4e873c, 'ringnav_keylong'),
+    'playset_equalizer_page_init': (0x4b642c, 'peq_page_init'),
+    'set_equalizer_value': (0x4f9230, 'peq_stock_eq'),
+    'home_page_init': (0x523c84, 'coverflow_home'),
+    'localmusic_page_init': (0x524424, 'ringnav_localmusic'),
+    # Library lists: an Unknown row with no songs is dropped
+    'load_localclass_list': (0x5088cc, 'ringnav_localclass'),
+    # An Albums row: the album it opens keeps only that album's songs
+    'load_album_detaillist': (0x508efc, 'ringnav_album_detail'),
+    # An artist's tabs: its albums' art keys (navigation.c ringnav_artist_list)
+    'load_localartist_list': (0x5093ac, 'ringnav_artist_list'),
+    # The three songtable writers; Coverflow keeps its album list until one runs.
+    'scanAllMusicFile': (0x4fc788, 'coverflow_scan_all'),
+    'scanSpecFolder': (0x4fc964, 'coverflow_scan_folder'),
+    'deleteMusicFromMusicDb': (0x500b5c, 'coverflow_delete_song'),
+    'mclSetBtVol': (0x5accec, 'ringnav_btvol'),
+    'main_loop_sleep_default': (0x648f00, 'ringnav_sleep'),
+    'systemset_about_page_init': (0x4bc80c, 'ringnav_about'),
+    # Podcasts and Audiobooks: folder_page opened at their folder, and Back there leaving it
+    'folder_page_init': (0x523330, 'ringnav_folder'),
+    'folder_back': (0x507ac8, 'ringnav_folder_back'),
+    # Videos: no input reaches the UI while q2video plays
+    'window_manager_dispatch_input_event': (0x66d49c, 'ringnav_input'),
+    # Key Tone: no click while music plays, and none on the buzzer while headphones or Bluetooth listen
+    'buzzeer_switch': (0x4f3cc8, 'ringnav_buzzer'),
+    # Power gains Charge limit and Low power; Audio settings gains Artists (Album Artist)
+    'systemset_sysset_page_init': (0x4cc4cc, 'ringnav_systemset'),
+    'systemset_display_page_init': (0x4c1d04, 'ringnav_display'),
+    'save_memoryplay_info': (0x516344, 'ringnav_savequeue'),
+    'mclLoadPlayList': (0x5aa8d4, 'ringnav_load'),
+    'mclNextSong': (0x5adbbc, 'ringnav_next'),
+    'mclPrevSong': (0x5ada98, 'ringnav_prev'),
+    'mclSetPlayMode': (0x5ab25c, 'ringnav_mode'),
+    # Manual Next/Prev: at the queue ends stock wraps or loads the next folder without mclNextSong
+    'player_change_music': (0x51503c, 'ringnav_change'),
+    'mcl_preload': (0x5a8c1c, 'ringnav_preload'),
+    'memeory_startplayer': (0x5164e0, 'ringnav_memory'),
+    'systemset_powermanager_page_init': (0x4c72d0, 'ringnav_powermanager'),
+    'playset_playset_page_init': (0x4b98d8, 'ringnav_audioset'),
+    # Spotify (patch/spotify.c): Streaming's row, and local music letting librespot go first
+    'stream_page_init': (0x52efdc, 'ringnav_stream'),
+    'mclStartPlayer': (0x5ad6ac, 'ringnav_start_player'),
+    # Tidal cache (patch/tidal.c): the stream URL thread's player start, with its song id in $s2
+    'mcl_tidalStartPlayer': (0x5ad240, 'tidal_start'),
+    # Ratings (navigation.c rate_bind): Now Playing's heart, held, opens the picker
+    'playing_page_init': (0x52ca88, 'ringnav_playing'),
+}
+# Hooked in iPod builds only, so Stock keeps these entry points stock.
+IPOD_HOOKS = {'playlist_rebuild': (0x4b2dac, 'ringnav_playlist'),
+              'widget_on_paint_background': (0x65c77c, 'ringnav_paint_bg'),
+              'bigcover_page_init': (0x5200ec, 'ringnav_bigcover'),
+              'style_get_color': (0x649f6c, 'ringnav_style_color'),
+              'image_manager_add': (0x6445d4, 'ringnav_image_add'),
+              'on_wm_keydown_before_fun': (0x4e8424, 'ringnav_keydown')}
+# The payload's stock_<name>_trampoline resumes each hook past its 3-word PIC prologue, in this order.
+TRAMPOLINES = {'btvol': 'mclSetBtVol', 'savequeue': 'save_memoryplay_info', 'load': 'mclLoadPlayList', 'next': 'mclNextSong', 'prev': 'mclPrevSong',
+               'mode': 'mclSetPlayMode', 'preload': 'mcl_preload', 'memory': 'memeory_startplayer', 'playlist': 'playlist_rebuild', 'keyup': 'on_wm_keyup_before_fun', 'touch': 'on_wm_tsdown_before_fun', 'paint': 'widget_on_paint_border',
+               'dispatch': 'widget_dispatch', 'keylong': 'on_wm_keylong_fun', 'eq': 'set_equalizer_value',
+               'home': 'home_page_init', 'localmusic': 'localmusic_page_init', 'localclass': 'load_localclass_list',
+               'paint_bg': 'widget_on_paint_background', 'playing': 'playing_page_init',
+               'systemset': 'systemset_sysset_page_init', 'display': 'systemset_display_page_init', 'color': 'style_get_color', 'image': 'image_manager_add',
+               'keydown': 'on_wm_keydown_before_fun', 'scan_all': 'scanAllMusicFile', 'scan_folder': 'scanSpecFolder',
+               'delete_song': 'deleteMusicFromMusicDb', 'sleep': 'main_loop_sleep_default',
+               'about': 'systemset_about_page_init', 'folder': 'folder_page_init', 'folder_back': 'folder_back',
+               'input': 'window_manager_dispatch_input_event', 'buzzer': 'buzzeer_switch',
+               'power': 'systemset_powermanager_page_init', 'audioset': 'playset_playset_page_init',
+               'change': 'player_change_music', 'detail': 'load_album_detaillist',
+               'artist': 'load_localartist_list', 'stream': 'stream_page_init', 'start_player': 'mclStartPlayer',
+               'tidal': 'mcl_tidalStartPlayer', 'bigcover': 'bigcover_page_init'}
+# Every audited stock PIC prologue resolves this GOT base.
+GP = 0xa26cc0
+# iPod: style_get_gradient has no PIC prologue. It is a leaf that null-checks the style and its
+# vtable, then tail-calls get_gradient (+0x18); its first two words (beqz a0; nop) become the jump
+# and the payload does the whole of it. The third word is pinned too, so the layout is the audited one.
+IPOD_LEAF = ('style_get_gradient', 0x649f3c, 'ringnav_style_gradient', (0x10800009, 0, 0x8c820000))
+# Videos: window_manager_paint is a leaf too (null-checks the manager and its vtable at +0x94, then
+# tail-calls paint, +0xc); the payload does the whole of it and skips it while q2video plays.
+WM_PAINT_LEAF = ('window_manager_paint', 0x66d46c, 'ringnav_wm_paint', (0x10800009, 0, 0x8c820094))
+# Videos' player (patch/video.c): a separate executable against the rootfs's own libraries,
+# with display_logo's inode metadata.
+HELPER, HELPER_LIKE = 'usr/bin/q2video', 'usr/bin/display_logo'
+HELPER_LIBS = ['lib/libc-2.28.so', 'lib/libpthread-2.28.so', 'usr/lib/libasound.so.2.0.0']
+# Rockbox dual boot (docs/boot.md#rockbox): S90play starts Rockbox whenever the card has it, as an
+# iPod with Rockbox does. Play/Pause held at power-on (patch/boot.c reads the key) or Rockbox's
+# exit 0x51 (Boot stock OS) starts Q2 Pod for that session only. boot-target selects the next
+# power-on default (missing or invalid retains Rockbox). ponytail: the card's mount is awaited (up to 3 s without a card)
+# unless Q2 Pod was asked for, as the card probe can't tell "no card" from "not yet". Rockbox runs
+# with the launcher contract in its tools/shanlingq2/README; demo starts when it exits, or when the
+# card has none. demo keeps its argv[0], which checkappprocess.sh pgreps for. iPod's Home Rockbox row
+# (navigation.c rockbox_open) leaves ROCKBOX_FLAG and kills demo: Rockbox runs again, its
+# watchdog stopped in case demo's kill was not reached, then demo once more. Any other end of demo
+# ends the loop, so the watchdog reboots as stock's would.
+BOOT = 'usr/bin/q2boot'
+S90PLAY = 'etc/init.d/S90play'
+S90PLAY_SHA = 'a6a7ed7d9a10e38801f4a41ec6f3c0ce2bc07c00d213c9278785c5f8d4520e24'
+ROCKBOX_FLAG = '/tmp/q2pod-rockbox'
+BOOT_HOOK = (b'    /release/bin/demo &\n', f'''    (
+        rb=/mnt/mmc/.rockbox
+        rockbox() {{
+            [ -f $rb/rockbox ] || return
+            (cd $rb && exec ./rockbox) > $rb/rockbox.log 2>&1
+            echo "exit $?" >> $rb/rockbox.log
+        }}
+        if [ "$(cat /mnt/data/boot-target 2>/dev/null)" != q2pod ] && ! /usr/bin/q2boot; then
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                [ -e /tmp/mmc_add ] && break
+                usleep 200000
+            done
+            rockbox
+        fi
+        while :; do
+            /release/bin/demo
+            [ -e {ROCKBOX_FLAG} ] || break
+            rm -f {ROCKBOX_FLAG}
+            killall checkappprocess.sh 2>/dev/null
+            rockbox
+        done
+    ) &
+'''.encode())
+# The byte in bluealsa's AAC capability holding the 44.1 kHz bit; see docs/internals.md.
+BLUEALSA = 'usr/bin/bluealsa'
+BLUEALSA_SHA = '0a4ffb7cc8207a46a3568440c5f31022b7125befd164e2f1af52537340a9892a'
+SCROBBLE_CA = 'etc/scrobble-ca.pem'
+AAC_44K1 = 0x317b8
+# DROP is acknowledged before the encoder handles its signal. Flush in the control
+# thread instead, so a delayed signal cannot discard the next track's first PCM.
+BT_DROP = 0x40cb50
+BT_DROP_HANDLER = 0x4147ac
+BT_DROP_PAYLOAD = 0x450000
+# Return address -> PCM ffb_t offset from the caller's io state. The last caller
+# is Q2's LDAC loop, which accumulates 256 samples in saved s6/s7 instead of ffb_t.
+BT_PCM_CALLERS = ((0x40649c, 0x74), (0x4150dc, 0x34), (0x41746c, 0x98),
+                  (0x418114, 0x34), (0x418c84, 0x60), (0x41a6ec, None))
+# platform_init's crash watchdog forks pgrep every 2 s; 10 s is still quick to reboot a dead UI.
+WATCHDOG = 'usr/bin/checkappprocess.sh'
+WATCHDOG_SHA = '68843ed739919420974ca55e6c5a6a2e52e63711b2faca116656440e5bd6a096'
+WATCHDOG_SLEEP = (b'\tsleep 2\n', b'\tsleep 10\n')
+# toolsSetRtcTime's command, with its padding; -u keeps the RTC in UTC. See docs/internals.md#clock.
+RTC_WRITE = (b'hwclock -w\0\0', b'hwclock -wu\0')
+# mclNextSong's shuffle pick; the payload calls the stock pick, then applies a pending Play next.
+SHUFFLE_CALL = (0x5addf0, 0x0411e8cb)  # bal mcl_shuffle_pick; its delay slot (a0=1) stays
+# Hold Return: only on_wm_keylong_fun's final Home call (bal) changes; all stock gates and its release
+# guard precede it. It becomes jal compact_now_playing (docs/ipod.md#hold-return).
+HOLD_RETURN = (0x4e8924, 0x04110fdf)
+# device_standby's bal awake_screen after the resume from Standby; Wake: Double press keeps it dark.
+STANDBY_WAKE = (0x4f7d24, 0x0411ff26)
+# The bal toolsTrimLeft on each name copy in the two library name comparators (0x5b9d40, 0x5ba658, the
+# Chinese and other-language sorts); they become jal ringnav_sort_key, which also drops a leading article.
+SORT_TRIMS = (0x5b9e38, 0x5b9ea4, 0x5ba750, 0x5ba7bc)
+# toolsLoadAllFile stops a scan at 20,000 songs: lw $2,count; slti $2,$2,0x4e20 before each entry. 65,000
+# overflows slti's signed immediate, so the lw becomes jal ringnav_scan_room and the slti loads the count
+# into a0 in its delay slot; the bnez after it, and its delay slot's stop-flag load, stay.
+SCAN_LIMIT = (0x5c977c, 0x8fc2c354, 0x28424e20, 0x8fc4c354)  # lw $2/$4, -0x3cac($fp)
+# Library Albums' cover cache names (navigation.c art_key): the row renderer's snprintf of the name,
+# with a2 the row (addiu a2,"%s" becomes move a2,s3), the Albums page's albumcoverinfo_init calls
+# and the album page's big cover snprintf become jal to the payload; so do an artist page's albums
+# renderer (its row in s2) and albumcoverinfo_init calls on tab entry, return and init.
+ALBUM_ART = ((0x4a388c, 'ringnav_art_name'), (0x4a421c, 'ringnav_albumcovers'), (0x4a42c0, 'ringnav_albumcovers'),
+             (0x4a5718, 'ringnav_albumcovers'), (0x4a72a4, 'ringnav_art_header'),
+             (0x4ab804, 'ringnav_artist_art_name'), (0x4ac840, 'ringnav_artist_covers'),
+             (0x4ae860, 'ringnav_artist_covers'), (0x4ae968, 'ringnav_artist_covers'),
+             (0x4aebc0, 'ringnav_artist_covers'))
+ALBUM_ART_ROW = ((0x4a3890, 0x24c66c04, 0x02603025), (0x4ab808, 0x24c66c04, 0x02403025))
+# Library Artists rows: the row bind's bal to class_icon becomes jal ringnav_class_icon, which hides the head.
+CLASS_ICON = 0x4b0cec
+# Album grids' scroll start no longer pauses the cover worker (sw $3,0($2) -> nop); see docs/internals.md.
+COVER_PAUSE = ((0x4aab60, 0xac430000, 0), (0x4a22d0, 0xac430000, 0))
+# An artist's albums scroll end divides yoffset by its 160 px rows, not 256; see docs/internals.md.
+ARTIST_COVER_ROW = ((0x4ad878, 0x244400ff, 0x240400a0),   # addiu $4,$2,0xff -> li $4,160
+                    (0x4ad880, 0x28430000, 0x0044001a),   # slti $3,$2,0 -> div $zero,$2,$4
+                    (0x4ad884, 0x0043200a, 0),            # movz $4,$2,$3 -> nop
+                    (0x4ad88c, 0x00042203, 0x00002012))   # sra $4,$4,8 -> mflo $4
+# switchBtPriority sends LDAC quality 0x16 (SQ, 660 kbps) for both HQ (row 0) and Standard (row 1).
+# The dispatch keeps 0x15 + row in its free 0x14($sp) slot, so HQ sends 0x15 (990 kbps); see docs/internals.md.
+LDAC_HQ = ((0x4f033c, 0x00042080, 0x00041880),   # sll $3,$4,2
+           (0x4f0340, 0x2442f030, 0x00431021),   # addu $2,$2,$3
+           (0x4f0344, 0x00442021, 0x8c42f030),   # lw $2,-0xfd0($2)
+           (0x4f0348, 0x8c820000, 0x24840015),   # addiu $4,$4,0x15
+           (0x4f0354, 0x00000000, 0xafa40014),   # sw $4,0x14($sp), jr's delay slot
+           (0x4f0360, 0x24040016, 0x8fa40014))   # lw $4,0x14($sp), was li $4,0x16
+# check_mem_thd's "open failed, skip the write" beq becomes b: it never writes 3 to drop_caches.
+DROP_CACHES = (0x5120a8, 0x12220006, 0x10000006)
+# The encoder thread's ts_read call (jalr $t9) becomes jal ringnav_ts_read, which makes the wheel's
+# ticks from the samples (playback.c wheel_sample).
+WHEEL_TS_READ = (0x625b6c, 0x0320f809)
+# English labels renamed: Now Playing More's queue, which stock calls "Playlists" (player_playlist,
+# used nowhere else; Local Music's are "Playlist"), System settings' Idle (system_powermanager) and
+# its standby/shutdown row.
+LABELS = ((b'player_playlist', b'Playlists', b'Queue'), (b'system_powermanager', b'Idle', b'Power'), (b'powerm_deep_off', b'standby/shutdown', b'Standby'))
+
+# The stock font (Arial merged with a CJK font) gives curly quotes the CJK em advance, a wide gap
+# inside words wherever a tag has one; its cmaps map them to the straight glyphs instead. Its hearts
+# mix too: the ratings' ♡ (CJK: smaller, higher, the em advance) is fitted to Arial's ♥ box, both a wider advance.
+FONT = 'release/assets/default/raw/fonts/default.ttf'
+QUOTES = {0x2018: 0x27, 0x2019: 0x27, 0x201c: 0x22, 0x201d: 0x22}
+
+def font_quotes(data):
+    """Only cmap is decompiled; fontTools copies every other table's bytes as they are, and head keeps
+    its stock timestamp so the build is reproducible."""
+    from fontTools.ttLib import TTFont
+    font = TTFont(io.BytesIO(data), lazy=True, recalcTimestamp=False)
+    for table in font['cmap'].tables:
+        if table.isUnicode():
+            check(all(c in table.cmap for c in QUOTES.values()), 'Font without straight quotes')
+            table.cmap.update({c: table.cmap[q] for c, q in QUOTES.items()})
+    glyf, hmtx, cmap = font['glyf'], font['hmtx'], font.getBestCmap()
+    full, empty = glyf[cmap[0x2665]], glyf[cmap[0x2661]]
+    check(not empty.isComposite() and empty.xMin == 2 and empty.yMax == 159, 'Unexpected ♡ glyph')
+    sx, sy = (full.xMax - full.xMin) / (empty.xMax - empty.xMin), (full.yMax - full.yMin) / (empty.yMax - empty.yMin)
+    empty.coordinates.transform(((sx, 0), (0, sy)))
+    empty.coordinates.translate((full.xMin - round(empty.xMin * sx), full.yMin - round(empty.yMin * sy)))
+    empty.coordinates.toInt()
+    empty.recalcBounds(glyf)
+    hmtx[cmap[0x2661]] = hmtx[cmap[0x2665]] = (hmtx[cmap[0x2665]][0] + 32, full.xMin)  # a gap between hearts
+    out = io.BytesIO()
+    font.save(out, reorderTables=False)
+    return out.getvalue()
+
+def relabel(data):
+    """A strings/*.bin value replaced: after a u16 0 and a u16 pair count, a u32 offset to each key and
+    value, in file order; the offsets past each change move with it."""
+    for key, old, new in LABELS:
+        at = data.find(b'\0' + key + b'\0' + old + b'\0')
+        check(at > 0 and data.count(b'\0' + key + b'\0') == 1, f'Unexpected {key.decode()} label')
+        at += len(key) + 2
+        n = 2 * struct.unpack_from('<H', data, 2)[0]
+        offsets = [o + len(new) - len(old) if o > at else o for o in struct.unpack_from(f'<{n}I', data, 4)]
+        data = bytearray(data[:at] + new + data[at + len(old):])
+        struct.pack_into(f'<{n}I', data, 4, *offsets)
+    return bytes(data)
+
+# demo's .pdr section (offset, size): MIPS procedure descriptors past every LOAD segment, which nothing
+# reads at run time. Zeroed, they pack to almost nothing, which keeps the Stock rootfs within stock's size.
+PDR = (0x61694c, 0x69d40)
+
+def run(*args):
+    return subprocess.check_output([str(a) for a in args], text=True)
+def sha(b): return hashlib.sha256(b).hexdigest()
+
+def source_sha256():
+    """Hash every build input, so a test run cannot silently use a stale output directory."""
+    h = hashlib.sha256()
+    tools = [ROOT/'tools'/f for f in ('build.py', 'ipod.py', 'peq.py', 'release.py')]
+    for path in sorted([*(p for p in ROOT.glob('assets/**/*') if p.is_file()), *ROOT.glob('patch/*'), *tools]):
+        h.update(str(path.relative_to(ROOT)).encode() + b'\0')
+        h.update(path.read_bytes())
+    return h.hexdigest()
+
+def check(condition, message):
+    if not condition: raise ValueError(message)
+def jpeg_size(b):
+    """Validate the splash's supported JPEG frame header and return its dimensions."""
+    check(b[:2] == b'\xff\xd8', 'Logo must be a JPEG')
+    i = 2
+    while i < len(b):
+        check(b[i] == 0xFF, 'Malformed JPEG')
+        while i < len(b) and b[i] == 0xFF: i += 1
+        check(i < len(b), 'Truncated JPEG marker')
+        marker = b[i]
+        i += 1
+        if marker in (0xD9, 0xDA): break
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7: continue
+        check(marker not in (0, 0xD8), 'Malformed JPEG marker')
+        check(i + 2 <= len(b), 'Truncated JPEG segment')
+        size = struct.unpack_from('>H', b, i)[0]
+        check(size >= 2 and i + size <= len(b), 'Invalid JPEG segment length')
+        if marker in (0xC0,0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xC9,0xCA,0xCB,0xCD,0xCE,0xCF):
+            check(size >= 8 and size == 8 + 3 * b[i+7], 'Invalid JPEG frame length')
+            # Stock display_logo indexes decoded pixels as RGB triples (0x400ec0 onward),
+            # but leaves libjpeg's output color space unchanged. Grayscale/CMYK are unsafe.
+            check(marker == 0xC0 and b[i+2] == 8 and b[i+7] == 3,
+                  'Logo must be an 8-bit, three-component baseline JPEG (not grayscale/CMYK)')
+            h, w = struct.unpack_from('>HH', b, i+3)
+            check(w > 0 and h > 0, 'Invalid JPEG dimensions')
+            return w, h
+        i += size
+    raise ValueError('No JPEG size marker')
+def symbols(p, table=None):
+    out = {}
+    for line in (table or run('readelf', '-Ws', p)).splitlines():
+        s = line.split()
+        if len(s) >= 8 and s[0].endswith(':'):
+            try: out[s[7]] = int(s[1], 16)
+            except ValueError: pass
+    return out
+
+def segments(b):
+    phoff = struct.unpack_from('<I', b, 28)[0]
+    size, num = struct.unpack_from('<HH', b, 42)
+    check(size == 32, 'Unexpected ELF program header size')
+    return [(phoff+i*size, struct.unpack_from('<8I', b, phoff+i*size)) for i in range(num)]
+def fileoff(b, a):
+    for _, (t, o, v, _, f, _, _, _) in segments(b):
+        if t == 1 and v <= a < v+f: return o+a-v
+    raise ValueError(f'Unmapped address {a:x}')
+
+FUNCTIONS = {
+ 'widget_on': ('unsigned', 'void *, unsigned, int (*)(void *, void *), void *'),
+ 'widget_set_visible': ('int', 'void *, int, int'),
+ 'widget_set_opacity': ('int', 'void *, unsigned'),
+ 'widget_set_enable': ('int', 'void *, int'),
+ # Crossfade's page (crossfade.c): stock's Boot volume slider, its value a double
+ 'slider_set_min': ('int', 'void *, double'), 'slider_set_max': ('int', 'void *, double'),
+ 'slider_set_step': ('int', 'void *, double'), 'slider_set_value': ('int', 'void *, double'),
+ 'widget_set_text_utf8': ('int', 'void *, const char *'),
+ 'text_selector_count_options': ('unsigned', 'void *'),
+ 'text_selector_set_selected_index': ('int', 'void *, unsigned'),
+ 'widget_use_style': ('int', 'void *, const char *'),
+ 'widget_set_name': ('int', 'void *, const char *'),
+ 'widget_set_sensitive': ('int', 'void *, int'),
+ 'widget_to_local': ('int', 'void *, void *'),
+ 'widget_dispatch_event_to_target_recursive': ('int', 'void *, void *'),
+ 'label_create': ('void *', 'void *, int, int, int, int'),
+ 'stock_search': ('int', 'void *, void *'),
+ 'widget_set_children_layout': ('int', 'void *, const char *'),
+ 'widget_resize': ('int', 'void *, int, int'),
+ 'widget_layout_children': ('int', 'void *'),
+ 'widget_lookup': ('void *', 'void *, const char *, int'),
+ 'scroll_bar_scroll_to': ('int', 'void *, int, unsigned'),
+ 'navigator_back_to_home': ('int', 'void'),
+ 'navigator_switch_to_with_context': ('int', 'const char *, const void *, int'),
+ 'window_manager': ('void *', 'void'),
+ 'window_manager_get_top_window': ('void *', 'void *'),
+ 'window_manager_is_animating': ('int', 'void *'),
+ 'window_manager_get_pointer_pressed': ('int', 'void *'),
+ 'widget_get_visible': ('int', 'void *'),
+ 'widget_get_prop_bool': ('int', 'void *, const char *, int'),
+ 'widget_get_prop_int': ('int', 'void *, const char *, int'),
+ 'widget_get_prop_str': ('const char *', 'void *, const char *, const char *'),
+ 'widget_get_text': ('const unsigned *', 'void *'),
+ 'widget_get_type': ('const char *', 'void *'),
+ 'widget_count_children': ('unsigned', 'void *'),
+ 'widget_get_child': ('void *', 'void *, unsigned'),
+ 'widget_set_prop_int': ('int', 'void *, const char *, int'),
+ 'widget_set_prop_str': ('int', 'void *, const char *, const char *'),
+ 'pages_set_active_by_name': ('int', 'void *, const char *'),
+ 'widget_invalidate_force': ('int', 'void *, void *'),
+ 'widget_animator_start': ('int', 'void *'),
+ 'widget_animator_prop_create': ('void *', 'void *, unsigned, unsigned, int, const char *'),  # Home's Settings slide
+ 'widget_animator_prop_set_params': ('int', 'void *, double, double'),
+ 'widget_animator_scroll_set_params': ('int', 'void *, int, int, int, int'),
+ 'slide_menu_set_value': ('int', 'void *, int'),
+ 'slide_menu_item_width': ('int', 'void *'),
+ 'slide_menu_on_scroll_done': ('int', 'void *, void *'),
+ 'widget_animator_scroll_create': ('void *', 'void *, unsigned, unsigned, int'),
+ 'widget_animator_on': ('unsigned', 'void *, unsigned, int (*)(void *, void *), void *'),
+ 'widget_set_focused': ('int', 'void *, int'),
+ 'widget_animator_pause': ('int', 'void *'),
+ 'widget_animator_destroy': ('int', 'void *'),
+ 'canvas_get_clip_rect': ('int', 'void *, void *'),
+ 'canvas_set_clip_rect': ('int', 'void *, const void *'),
+ 'canvas_set_fill_color': ('int', 'void *, unsigned'),
+ 'canvas_set_stroke_color': ('int', 'void *, unsigned'),
+ 'canvas_stroke_rect': ('int', 'void *, int, int, int, int'),
+ 'canvas_fill_rect': ('int', 'void *, int, int, int, int'),
+ 'canvas_draw_icon': ('int', 'void *, void *, int, int'),
+ 'canvas_set_font': ('int', 'void *, const char *, unsigned'),
+ 'canvas_set_text_color': ('int', 'void *, unsigned'),
+ 'canvas_draw_text_in_rect': ('int', 'void *, const unsigned *, unsigned, const void *'),
+ 'canvas_draw_text': ('int', 'void *, const unsigned *, unsigned, int, int'),  # Books (books.c)
+ 'canvas_measure_text': ('float', 'void *, const unsigned *, unsigned'),
+ 'canvas_fill_rounded_rect': ('int', 'void *, const void *, const void *, const void *, unsigned'),
+ 'canvas_stroke_rounded_rect': ('int', 'void *, const void *, const void *, const void *, unsigned, unsigned'),
+ # The PEQ curve (peq_ui.c) and the visualizer (visualizer.c): AWTK's software nanovg, float_t float, color_t by value
+ 'canvas_get_vgcanvas': ('void *', 'void *'),
+ 'vgcanvas_save': ('int', 'void *'), 'vgcanvas_restore': ('int', 'void *'),
+ 'vgcanvas_translate': ('int', 'void *, float, float'),
+ 'vgcanvas_begin_path': ('int', 'void *'), 'vgcanvas_close_path': ('int', 'void *'),
+ 'vgcanvas_move_to': ('int', 'void *, float, float'), 'vgcanvas_line_to': ('int', 'void *, float, float'),
+ 'vgcanvas_arc': ('int', 'void *, float, float, float, float, float, int'),
+ 'vgcanvas_fill': ('int', 'void *'), 'vgcanvas_stroke': ('int', 'void *'),
+ 'vgcanvas_set_fill_color': ('int', 'void *, unsigned'), 'vgcanvas_set_stroke_color': ('int', 'void *, unsigned'),
+ 'vgcanvas_set_fill_linear_gradient': ('int', 'void *, float, float, float, float, unsigned, unsigned'),
+ 'vgcanvas_set_line_width': ('int', 'void *, float'), 'vgcanvas_set_line_cap': ('int', 'void *, const char *'),
+ 'pointer_event_init': ('void *', 'void *, int, void *, int, int'),
+ 'time_now_ms': ('unsigned', 'void'),
+ 'sleep_ms': ('int', 'unsigned'),
+ 'timer_add': ('unsigned', 'int (*)(const void *), void *, unsigned'),
+ 'timer_remove': ('int', 'unsigned'),
+ 'tk_strcmp': ('int', 'const char *, const char *'),
+ 'slide_menu_scroll_to_next': ('int', 'void *'),
+ 'slide_menu_scroll_to_prev': ('int', 'void *'),
+ 'table_client_stop_animator_scroll': ('int', 'void *'),
+ 'table_client_set_yoffset': ('int', 'void *, int'),
+ 'widget_dispatch_simple_event': ('int', 'void *, unsigned'),
+ 'scroll_view_set_offset': ('int', 'void *, int, int'),
+ 'table_client_scroll_to': ('int', 'void *, int'),
+ 'scroll_view_scroll_delta_to': ('int', 'void *, int, int, int'),
+ 'widget_destroy_children': ('int', 'void *'),
+ 'list_item_create': ('void *', 'void *, int, int, int, int'),
+ 'hscroll_label_create': ('void *', 'void *, int, int, int, int'),
+ 'set_hscroll_label_attribute': ('void', 'void *'),
+ 'hscroll_label_set_only_focus': ('int', 'void *, int'),
+ 'hscroll_label_set_ellipses': ('int', 'void *, int'),
+ 'widget_off_by_func': ('int', 'void *, unsigned, void *, void *'),
+ 'window_close': ('int', 'void *'),
+ 'navigator_to': ('int', 'const char *'),
+ 'navigator_to_with_context': ('int', 'const char *, const void *'),
+ 'window_manager_get_input_device_status': ('char *', 'void *'),
+ 'airplayGetFlag': ('int', 'void'),
+ 'tk_snprintf': ('int', 'char *, unsigned, const char *, ...'),
+ 'toolsTimeItoa': ('int', 'char *, int'),
+ 'getMusicByAlbum': ('int', 'const char *'),
+ 'getMusicByAlbumAndSonger': ('int', 'const char *, const char *, int'),
+ 'getMusicByAlbumAndAlbumSonger': ('int', 'const char *, const char *, int'),
+ 'toolsLoadDirectory': ('int', 'const char *'),
+ # Queue menu rows (navigation.c): artist/composer/genre queries, My Fav, the batch selection record
+ 'getMusicBySonger': ('int', 'const char *'),
+ 'getMusicByAlbumArtist': ('int', 'const char *'),
+ 'getMusicByComposer': ('int', 'const char *'),
+ 'getMusicByGenre': ('int', 'const char *'),
+ 'getMusicByAlbumAndComposer': ('int', 'const char *, const char *, int'),
+ 'getMusicByAlbumAndGenre': ('int', 'const char *, const char *, int'),
+ 'checkFavExist': ('int', 'void *'),
+ 'getAllFav': ('int', 'void'),
+ # Long Songs (navigation.c): a file's length, probed once, as stock's scanner reads tags
+ 'taglib_file_new': ('void *', 'const char *'),
+ 'taglib_file_audioproperties': ('void *', 'void *'),
+ 'taglib_file_free': ('void', 'void *'),
+ 'deleteMusicFromFav': ('int', 'void *'),
+ 'batch_init_selectrecord': ('int', 'int'),
+ 'batch_set_selectitem': ('int', 'int'),
+ 'batch_add_file': ('int', 'int, int, void *, void *, int'),
+ 'navigator_window_is_exist': ('int', 'const char *'),
+ 'mclStartPlayer': ('int', 'void'),
+ 'mclStop': ('int', 'void'),
+ 'mclGetPlayTime': ('int', 'int *, int *'),
+ 'mclSetStartSeekTime': ('int', 'int'),
+ 'mcl_open_preload': ('int', 'void'),
+ 'mclLoadPlayList': ('int', 'void *, int, int'),
+ 'mcl_shuffle_pick': ('int', 'int'),
+ 'getAllAlbum': ('int', 'void'),
+ # Shuffle Songs (navigation.c): every song, shuffle saved as the play-mode setting does, a random start
+ 'getAllMusic': ('int', 'int'),
+ 'config_playmode': ('int', 'int, int'),
+ 'toolsRandnum': ('int', 'int'),
+ 'widget_restack': ('int', 'void *, unsigned'),
+ 'toolsThumbSpecCover': ('int', 'const char *, const char *, int, int'),
+ 'toolsGetAlbumCover': ('int', 'const char *, const char *, int, int'),
+ 'window_create': ('void *', 'void *, int, int, int, int'),
+ 'widget_factory': ('void *', 'void'),
+ 'widget_factory_create_widget': ('void *', 'void *, const char *, void *, int, int, int, int'),
+ 'image_create': ('void *', 'void *, int, int, int, int'),
+ 'image_set_draw_type': ('int', 'void *, int'),
+ 'image_base_set_image': ('int', 'void *, const char *'),
+ 'widget_load_image': ('int', 'void *, const char *, void *'),
+ 'widget_unload_image': ('int', 'void *, void *'),
+ 'list_view_create': ('void *', 'void *, int, int, int, int'),
+ 'scroll_view_create': ('void *', 'void *, int, int, int, int'),
+ 'navigator_back': ('int', 'void'),
+ 'write_int_config': ('int', 'int, const char *, const char *'),
+ 'toolsReadConfig': ('int', 'const char *, const char *, const char *, char *, const char *'),
+ 'button_create': ('void *', 'void *, int, int, int, int'),
+ 'widget_move_resize': ('int', 'void *, int, int, int, int'),
+ 'tk_str_end_with': ('int', 'const char *, const char *'),
+ 'tk_str_start_with': ('int', 'const char *, const char *'),
+ 'image_manager': ('void *', 'void'),
+ 'image_manager_unload_all': ('int', 'void *'),
+ 'bitmap_get_line_length': ('unsigned', 'void *'),
+ 'bitmap_lock_buffer_for_write': ('unsigned char *', 'void *'),
+ 'bitmap_unlock_buffer': ('int', 'void *'),
+ # Coverflow depth (coverflow.c): its frame bitmap, reading decoded covers, and the slide_menu stride
+ 'bitmap_create_ex': ('void *', 'unsigned, unsigned, unsigned, unsigned'),
+ 'bitmap_destroy': ('int', 'void *'),
+ 'bitmap_lock_buffer_for_read': ('const unsigned char *', 'void *'),
+ 'canvas_draw_image': ('int', 'void *, void *, const void *, const void *'),
+ 'slide_menu_set_spacer': ('int', 'void *, int'),
+ 'playing_timer_start': ('int', 'void *'),
+ 'playing_timer_clear': ('int', 'void *'),
+ 'player_seek_time': ('int', 'int'),
+ 'player_playtime_and_length': ('int', 'int *, int *'),  # elapsed, total: track seconds; -1 none
+ 'player_start': ('int', 'void *, int, int, int'),
+ 'buzzeer_switch': ('int', 'int'),  # the stock key click; it reads g_keytone_flag
+ 'on_wm_keyup_fun': ('int', 'void *, void *'),  # stock key-up: np_single replays a centre release
+ 'get_wifisignal': ('int', 'void'),  # the status bar's Wi-Fi bars, 1-4; -1 when not connected
+ # Podcasts and Audiobooks (navigation.c): folder_page's reload of g_folder_path, title and list rebuild
+ 'folder_reload_data': ('int', 'void'),
+ 'folder_reinit_navbarname': ('int', 'void'),
+ 'folder_refresh': ('int', 'void *'),
+ # Videos (books.c): stop the music, the DAC's power, and the screen and standby timeouts held off
+ 'mclGetOutputWay': ('int', 'void'),
+ 'mclGetLyricSize': ('int', 'void'),  # the playing track's lyric lines, 0 without
+ 'mclGetPlayStatus': ('int', 'void'),  # 1 stopped, 2 playing, 3 paused (mclStop, mclSetResume, mclSetPause)
+ 'player_stop': ('int', 'void'),
+ 'save_memoryplay_info': ('int', 'void'),  # Memory playback's queue and position, as into_poweroff saves them
+ 'mclSetDacPwr': ('int', 'int'),
+ 'reset_poweroptions_timer': ('int', 'int, int, int'),
+ 'awake_screen': ('int', 'void'),  # the backlight on, if off; Standby's resume calls it (STANDBY_WAKE)
+ 'btctl_transport_get_volume': ('int', 'void'),
+ 'btctl_transport_set_volume': ('int', 'int'),
+ 'device_set_volume': ('int', 'int, int'),  # volume, notify: the DAC's or hciplayer's, as the volume dialog
+ # Spotify (spotify.c): the headphone output as a headset insert sets it, then PCM mode and unmuted, as AirPlay's page
+ 'config_outputchannel': ('int', 'int, int'),  # g_headset_output, 2
+ 'mclSetPcmMode': ('int', 'void'),
+ 'mclSetMute': ('int', 'int'),
+ 'toolsTrimLeft': ('void', 'char *'),
+ 'switch_charge_enable': ('int', 'int'),  # 1 charges: the active-low charge enable on GPIO PE22 (usbmode_page_init)
+ # Coverflow's Sort: another ORDER BY over getAllAlbum's grouping, filled by its own row callback
+ 'toolsQueryDbTable': ('int', 'const char *, const char *, void *, int'),  # db, sql, row, name sort
+ 'album_row': ('int', 'void *, int, char **, char **'),
+ 'albumcoverinfo_init': ('int', 'void *'),  # a list's cover tasks, each a copy of its row's name and path
+ 'class_icon': ('int', 'void *, int'),  # Artists, Composers and Genres rows' img_icon (CLASS_ICON)
+}
+# Local stock routines in the SHA-256-pinned V1.32 executable.
+PRIVATE_FUNCTIONS = {
+    "playlist_rebuild": IPOD_HOOKS['playlist_rebuild'][0],  # picker init and re-entry rebuild all rows
+    "stock_search": 0x5241c4,
+    "slide_menu_item_width": 0x5f3040,
+    "slide_menu_on_scroll_done": 0x5f3654,
+    "mcl_preload": HOOKS['mcl_preload'][0],
+    "mcl_open_preload": 0x5a8948,
+    "mcl_shuffle_pick": 0x5a8120,
+    "album_row": 0x4fc324,  # getAllAlbum's sqlite3_exec callback: id, album, songer, fileurl to a record
+    "folder_refresh": 0x52176c,  # folder_page's navbar and table from p_deque_showlist (its init, back)
+    "class_icon": 0x4afc14,  # a category row's picture: the head for Artists, a genre icon, else .downpic
+}
+GLOBALS = ['g_time24h_flag', 'g_backlight_status', 'g_lockscreen_pageflag', 'g_testmode_flag',
+           'g_bluetoothflag', 'bt_linkstatus', 'g_guideflag', 'g_poweroff_state', 'g_usblink_status', 'bt__recv_pageflag',
+           'g_power_longkey', 'g_ingore_bootkey_flag', 'g_equalizer_flag', 'g_navbar_status', 'g_playcover_type',
+           'g_keytone_flag', 'g_folder_layer', 'g_delete_flag', 'g_volume', 'g_maxvolume',
+           'g_po_status', 'g_bal_status',  # 3.5 mm and 4.4 mm jacks: 1 plugged (check_headset_status)
+           'g_usbvol_mode',  # USB DAC volume: 0 fixed, else the volume (config_usbvolmode, device_set_volume)
+           'g_usbdac_chargeflag',  # USB mode's charge choice, which switch_charge_enable gets there
+           'g_memory_play', 'g_carmode',
+           'g_headset_output',  # the output config_outputchannel sets: 0, 1 the jacks, 2 Bluetooth
+           'g_usbdet_value']  # 1 while a USB cable is in (USB mode's scan prompt outlives it)
+# Audited stock browsing state, deque pointers, art locks, the status bar widget
+# (system_bar_init stores it), the playing cover's track path and the playing track's tags as
+# player_get_id3info parsed them; sizes are checked against the ELF.
+CONTEXT_DATA = {'bt_showcoding': 4, 'g_memory_info': 3476, 'g_folder_path': 1024, 'g_class_type': 4,
+                'g_local_classinfo_save': 912, 'g_artist_type': 4, 'album_modetype': 4,
+                'p_deque_showlist': 4, 'tools_pdeq_directory': 4, 'mcl_pdeqplaylist': 4,
+                'parse_cover_mutex': 24, 'g_playcover_mutex': 24, 'system_bar': 4, 'g_lastcover_url': 1024,
+                'g_dacoff_time': 4, 'p_vector_select_record': 4,
+                'g_play_id3_info': 2716,
+                # Artists' source (PLAYSET ARTISTTYPE, the artist page's switch: 1 album artist);
+                # the battery level (0-100) and the charger's state (1, 2 charging), get_battery_capacity's
+                'artist_type': 4, 'g_power_capacity': 4, 'g_power_chargestate': 4,
+                'pdeq_albumcoverlist': 4, 'aclist_mutex': 24,
+                'tidalStreamingLevelNow': 4}  # the quality the Tidal URL thread asked for
+# Windows the payload creates at runtime (window_create), so no rootfs asset names them.
+PAYLOAD_WINDOWS = {'coverflow_page', 'photos_page', 'books_page', 'mostplayed_page', 'shuffle_page', 'ratings_page', 'rated_page', 'longsongs_page', 'spotify_page',
+                   'radio_page', 'radionp_page'}
+ICONS = ['menu_coverflow.png', 'menu_coverflowdown.png']
+# The stock EQ preset page and the images only it and the stock equalizer page show: the PEQ
+# editor clears that page's widgets on init and never binds the preset button, so none can load.
+STOCK_EQ = ['release/assets/default/raw/ui/playset/preseteq_page.bin'] + [
+    f'release/assets/default/raw/images/xx/{n}.png' for n in
+    ['eq_bg', 'eq_off', 'eq_sidebg', 'eqbox'] + [f'eq_{p}{s}' for p in
+    ('blues', 'classical', 'custon', 'dance', 'jazz', 'metal', 'pop', 'rock', 'scene') for s in ('', '_select')]]
+# iPod: the Home carousel's card and arrow images; only the stock home_page.bin names them.
+CAROUSEL = [f'release/assets/default/raw/images/xx/menu_{n}.png' for n in
+    [*(c + s for c in ('playing', 'music', 'folder', 'stream', 'playset', 'sysset') for s in ('', 'down')), 'left', 'right']]
+# Superseded library versions (the unversioned and soname links already resolve to the newer ones)
+# and on-device debugging tools; nothing in the rootfs names them.
+OBSOLETE = ['usr/lib/libdbus-1.so.3.19.8', *(f'usr/lib/lib{n}-2.0.so.0.5400.3' for n in
+            ('gio', 'glib', 'gmodule', 'gobject', 'gthread')),
+            *(f'usr/bin/{n}' for n in ('strace', 'strace-log-merge', 'sqlite3', 'hcidump'))]
+
+FLAGS = ['--target=mipsel-linux-gnu','-march=mips32r2','-mabi=32','-mfp64',
+         '-mno-abicalls','-fno-pic','-G0','-ffreestanding','-fno-builtin',
+         '-fno-stack-protector','-fno-unwind-tables','-fno-asynchronous-unwind-tables',
+         '-Oz','-Wall','-Wextra','-Werror']
+
+def hooks(ipod): return HOOKS | IPOD_HOOKS if ipod else HOOKS
+
+def compile_payload(out, ipod=False):
+    """Compile and link the payload."""
+    from peq import compile_common
+    extra = compile_common(out, out/'stock-demo', ipod=ipod)  # also writes the libc/libcstl imports navigation.c uses
+    run('clang',*FLAGS,f'-DIPOD={int(ipod)}','-I',out,'-c',ROOT/'patch/navigation.c','-o',out/'navigation.o')
+    asm = ['.set noreorder', '.text']
+    for x, hook in TRAMPOLINES.items():
+        asm += [f'.globl stock_{x}_trampoline', f'stock_{x}_trampoline:', f'lui $gp, {GP >> 16}',
+                f'ori $gp, $gp, {GP & 65535}', f'j 0x{(HOOKS | IPOD_HOOKS)[hook][0] + 12:x}', 'nop']
+    (out/'trampoline.S').write_text('\n'.join(asm)+'\n')
+    run('clang',*FLAGS,'-c',out/'trampoline.S','-o',out/'trampoline.o')
+    run('ld.lld','-m','elf32ltsmip','--gc-sections','-T',ROOT/'patch/link.ld','-e','ringnav',
+        *[f'--undefined={name}' for _, name in hooks(ipod).values()], *[f'--undefined={IPOD_LEAF[2]}'] * ipod,
+        f'--undefined={WM_PAINT_LEAF[2]}', '--undefined=ringnav_bootmode', '--undefined=ringnav_ts_read',
+        out/'navigation.o',out/'trampoline.o',*extra,'-o',out/'patch.elf')
+    run('llvm-objcopy','-O','binary',out/'patch.elf',out/'patch.bin')
+    return symbols(out/'patch.elf')
+
+def compile_helper(out, cat, src, name, rels):
+    """Link patch/src (and start.c) as name against the stock rootfs's libraries rels."""
+    libs = []
+    for rel in rels:
+        libs.append(out/rel.rsplit('/', 1)[-1])
+        libs[-1].write_bytes(cat(rel))
+    objs = [out/f'{s}.o' for s in (src, 'start')]
+    for o in objs:
+        run('clang', *[f for f in FLAGS if f not in ('-mno-abicalls', '-G0')], '-mnan=2008', '-mabs=2008',
+            '-mabicalls', '-c', ROOT/'patch'/f'{o.stem}.c', '-o', o)
+    run('ld.lld', '-m', 'elf32ltsmip', '-e', '__start', '--dynamic-linker', '/lib/ld-linux-mipsn8.so.1',
+        '--image-base=0x400000', '-z', 'noexecstack', '--gc-sections', '-s', '--hash-style=sysv', '--build-id=none',
+        *objs, *libs, '-o', out/name)
+    return (out/name).read_bytes()
+
+def patch_s90play(raw):
+    check(sha(raw) == S90PLAY_SHA, 'Unsupported S90play')
+    return raw.replace(*BOOT_HOOK)
+
+def append_payload(image, payload, base, memsz, label):
+    """Map payload at base through the image's final PT_NULL header, R/W/X: payloads keep static state."""
+    nulls = [(o,p) for o,p in segments(image) if p[0] == 0]
+    check(len(nulls) == 1 and nulls[0][0] == segments(image)[-1][0], f'{label}: no final PT_NULL slot')
+    check(all(p[2]+p[5] < base for _,p in segments(image) if p[0] == 1), f'{label}: payload mapping overlaps')
+    off = (len(image)+65535)&~65535
+    image.extend(bytes(off-len(image)))
+    image.extend(payload)
+    struct.pack_into('<8I',image,nulls[0][0],1,off,base,base,len(payload),memsz,7,65536)
+
+def patch_bluealsa(raw):
+    """Offer AAC at 48 kHz only. A headset that opens the stream itself (AirPods out of the case)
+    picks 44.1 kHz, and bluealsa, still fed 48 kHz, drops about 8% of the AAC frames."""
+    check(sha(raw) == BLUEALSA_SHA, 'Unsupported bluealsa binary')
+    image = bytearray(raw)
+    image[AAC_44K1] = 0
+    # o32: preserve PCM and ra; hold its fd mutex while flushing the nonblocking
+    # FIFO in 32 KiB batches, then send DROP. No encoder restart or codec change.
+    words = [0x27bdffe0, 0xafbf001c, 0xafb00018, 0x00808025,
+             0x0c10c1a4, 0x2604000c,
+             0x0c10502e, 0x02002025, 0x1c40fffd, 0,
+             0x0c10c0e8, 0x2604000c,
+             0x8e040000, 0x24050006, 0x0c102dce, 0x24840050,
+             0x8fb00018, 0x8fbf001c, 0x00001025, 0x03e00008, 0x27bd0020]
+    reset = BT_DROP_PAYLOAD + len(words) * 4
+    # The shared read helper receives a raw tail pointer, not the ffb_t. Rewind
+    # each audited caller's partial PCM and update the helper's pointer/capacity
+    # before it repolls; otherwise old and new tracks share one encoder frame.
+    words += [0x8fa80054]  # saved return address
+    for caller, offset in BT_PCM_CALLERS:
+        check(struct.unpack_from('<I', raw, fileoff(raw, caller-8))[0] == 0x0c105174,
+              'Bluetooth PCM caller mismatch')
+        body = ([0x264b0000 | offset, 0x8d760000, 0xad760004, 0x8d750008]
+                if offset is not None else
+                [0x8fab004c, 0x8fac0040, 0x02cbb023, 0x02ccb021,
+                 0xafac004c, 0x24150100, 0xafb50048])
+        body += [0x081051e4, 0]  # existing OPEN/RESUME pacing reset and repoll
+        words += [0x3c0a0000 | caller >> 16, 0x354a0000 | caller & 0xffff,
+                  0x150a0000 | len(body)+1, 0, *body]
+    words += [0x081051e4, 0]  # unknown caller: reset pacing without touching its buffer
+    payload = struct.pack(f'<{len(words)}I', *words)
+    append_payload(image, payload, BT_DROP_PAYLOAD, len(payload), 'bluealsa')
+    struct.pack_into('<2I', image, fileoff(raw, BT_DROP),
+                     0x08000000 | BT_DROP_PAYLOAD >> 2, 0)
+    # Never flush the new track's FIFO from this asynchronously handled signal.
+    struct.pack_into('<2I', image, fileoff(raw, BT_DROP_HANDLER), 0x08000000 | reset >> 2, 0)
+    return bytes(image)
+
+def patch_watchdog(raw):
+    check(sha(raw) == WATCHDOG_SHA, 'Unsupported watchdog script')
+    return raw.replace(*WATCHDOG_SLEEP)
+
+def build(zip_path, out, logo, ipod=False, dev=False):
+    variant = 'ipod' if ipod else 'stock'
+    version = VERSIONS[variant]
+    out.mkdir(parents=True, exist_ok=True)
+    check(not (out/'update.tar').exists(), 'Output already exists; use a fresh --out directory')
+    if dev:  # the next number in the untracked .build-number
+        counter = ROOT/'.build-number'
+        dev = int(counter.read_text()) + 1 if counter.exists() else 1
+        counter.write_text(f'{dev}\n')
+        version = dev_tag(dev, version[-1])
+    source = source_sha256()
+    raw = zip_path.read_bytes()
+    check(sha(raw) == ZIP_SHA, 'Unsupported ZIP: SHA-256 differs from audited original')
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        tarbytes = z.read('Q2 Firmware V1.32/update.tar')
+    with tarfile.open(fileobj=io.BytesIO(tarbytes)) as t:
+        meta = t.getmembers()
+        check([m.name for m in meta] == ['firmware_v20.info','recovery-update',
+              'recovery-update/xImage','recovery-update/rootfs.squashfs'], 'Unexpected package members')
+        blobs = {m.name:t.extractfile(m).read() for m in meta if m.isfile()}
+    info = blobs['firmware_v20.info'].decode().splitlines()
+    check(info[:2] == ['Shanling Q2','V1.32'], 'Wrong model/version')
+    for line in info[2:]:
+        digest, name = line.split()
+        check(hashlib.md5(blobs[name]).hexdigest() == digest, 'Stock MD5 mismatch')
+    sq = out/'stock.squashfs'; sq.write_bytes(blobs['recovery-update/rootfs.squashfs'])
+    def cat(path): return subprocess.check_output(['unsquashfs', '-cat', str(sq), path])
+    raw_demo = cat('release/bin/demo')
+    check(sha(raw_demo) == DEMO_SHA, 'Unsupported demo binary')
+    # Every allowlisted context must be a window name. The runtime name is the root "name"
+    # property of the UI asset, not the asset path, so check the stock rootfs assets directly:
+    # a prefix-trimmed typo cannot silently disable a screen this way.
+    from ipod import (AUDIT, ARTIST_ALBUMS, ARTIST_PAGE, HOME_PAGE, SETTINGS_ICONS, inc, UI_ASSETS, patch_asset,
+                      QUIET_ICONS, quiet_icon, imagemagick, patch_code, patch_style, patch_word, settings_icon)
+    contexts = re.findall(r'"([^"]+)"', (ROOT/'patch/contexts.inc').read_text())
+    check(contexts, 'No navigation contexts audited')
+    windows = set()
+    for line in run('unsquashfs', '-l', sq).splitlines():
+        found = re.search(r'/raw/ui/(.+)\.bin$', line)
+        if not found: continue
+        rel = found.group(1)
+        data = cat('release/assets/default/raw/ui/'+rel+'.bin')
+        i = data.find(b'name\x00')
+        name = data[i+5:data.find(b'\x00', i+5)].decode('utf-8', 'replace') if i >= 0 else ''
+        windows.add(name or rel.split('/')[-1])
+        # iPod pre-sizes the settings icons, so no UI asset may name one (only native settings code does).
+        for icon in SETTINGS_ICONS:
+            check(icon.removesuffix('.png').encode() + b'\0' not in data, f'{rel}: names settings icon {icon}')
+    check(windows, 'No UI assets in the stock rootfs')
+    for name in contexts:
+        check(name in windows | PAYLOAD_WINDOWS, f'Context {name} is not a window name in the stock rootfs')
+    demo = out/'stock-demo'; demo.write_bytes(raw_demo)
+    symbol_table = run('readelf', '-Ws', demo)
+    syms = symbols(demo, symbol_table)
+    syms.update(PRIVATE_FUNCTIONS)
+    header = [f'#define RING_STEP {RING_STEP}']
+    for name in GLOBALS:
+        check(re.search(rf'\b1\s+OBJECT\s+GLOBAL\s+DEFAULT\s+\d+\s+{name}$',
+                        symbol_table, re.M), f'{name}: byte global size mismatch')
+    for name, size in CONTEXT_DATA.items():
+        check(re.search(rf'\b{size}\s+OBJECT\s+GLOBAL\s+DEFAULT\s+\d+\s+{name}$',
+                        symbol_table, re.M), f'{name}: context data size mismatch')
+        header.append(f'#define {name} ((const unsigned char *)0x{syms[name]:x}u)')
+    # iPod's image hook leaves the settings icons' category colours alone (navigation.c settings_icon).
+    names = ''.join(n.removesuffix('.png') + '\\0' for n in SETTINGS_ICONS)
+    header.append(f'#define SETTINGS_ICON_NAMES "{names}"')
+    header.append(f'#define ROCKBOX_FLAG "{ROCKBOX_FLAG}"')  # Home's Rockbox row, for S90play
+    # About: the stock firmware's version on its own row, and this build's on the CFW. Version row.
+    header += [f'#define STOCK_VERSION "{info[1]}"', f'#define Q2POD_VERSION "{VERSION} {"iPod" if ipod else "Stock"}{f" dev {dev}" if dev else ""}"']
+    (out/'stock.h').write_text('\n'.join(header)+'\n')
+    ps = compile_payload(out, ipod)
+    payload = (out/'patch.bin').read_bytes()
+    check(len(payload) < SCRATCH-BASE, 'Payload overlaps its scratch page')
+    check(ps['__scratch_start'] == SCRATCH, 'Scratch state moved')
+    check(ps['__scratch_end'] <= SCRATCH + 0x10000, 'Scratch state exceeds its page')
+    patched = bytearray(raw_demo)
+    def jump(off, name): patched[off:off+8] = struct.pack('<II', 0x08000000 | (ps[name] >> 2), 0)
+    for name, (address, replacement) in hooks(ipod).items():
+        check(syms[name] == address, f'{name}: callback address mismatch')
+        off = fileoff(patched, address)
+        prolog = struct.unpack_from('<III', patched, off)
+        check(prolog[0] >> 16 == 0x3c1c and prolog[1] >> 16 == 0x279c and
+              prolog[2] == 0x0399e021, f'{name}: unexpected PIC prologue')
+        low = prolog[1] & 65535
+        gp = ((prolog[0] & 65535) << 16) + (low if low < 32768 else low - 65536) + address
+        check(gp == GP, f'{name}: unexpected GOT base')
+        jump(off, replacement)
+    for name, address, replacement, words in [WM_PAINT_LEAF] + [IPOD_LEAF] * ipod:
+        off = fileoff(patched, address)
+        check(syms[name] == address and struct.unpack_from('<III', patched, off) == words, f'{name}: unexpected code')
+        jump(off, replacement)
+    if ipod:
+        # style_get_color's own bal style_get_gradient, returning to STYLE_COLOR_GRADIENT_RET, stays unmapped.
+        ret = inc('STYLE_COLOR_GRADIENT_RET')
+        check(struct.unpack_from('<I', patched, fileoff(patched, ret - 8))[0] == 0x04110000 | (IPOD_LEAF[1] - ret + 4) >> 2 & 0xffff,
+              'style_get_color: unexpected gradient call')
+    # tidal_start reads the song id from $s2: set to the thread's own copy at 0x48647c, freed after
+    # its only mcl_tidalStartPlayer call (lw t9; jalr; move a0, s7).
+    check(struct.unpack_from('<I', patched, fileoff(patched, 0x48647c))[0] == 0x00409025 and
+          struct.unpack_from('<III', patched, fileoff(patched, 0x486d88)) == (0x8f99aaec, 0x0320f809, 0x02e02025),
+          'Tidal URL thread: unexpected song id register')
+    # ringnav_mode leaves advanced play on for player_initconfig's call, which returns to INITCONFIG_MODE_RET.
+    ret = inc('INITCONFIG_MODE_RET')
+    check(struct.unpack_from('<II', patched, fileoff(patched, ret - 12)) == (0x8f99b77c, 0x0320f809),
+          'player_initconfig: unexpected mclSetPlayMode call')
+    patch_word(patched, 0x4f999c, 0x0411e992, 0x0c000000 | (ps['ringnav_bootmode'] >> 2),
+               'config_init preserves the saved queue when applying the boot play mode')
+    from peq import patch_player
+    raw_player = cat('usr/bin/hciplayer')
+    audio = patch_player(raw_player, out/'peq')
+    bluealsa = patch_bluealsa(cat(BLUEALSA))
+    (out/'bluealsa').write_bytes(bluealsa)
+    (out/'watchdog').write_bytes(patch_watchdog(cat(WATCHDOG)))
+    for address, old, new in ARTIST_ALBUMS:
+        patch_word(patched, address, old, new, 'artist detail opens on Albums')
+    patch_word(patched, *SHUFFLE_CALL, 0x0c000000 | (ps['ringnav_shuffle'] >> 2),
+               'shuffle honours Play next')
+    patch_word(patched, *HOLD_RETURN, 0x0c000000 | (ps['compact_now_playing'] >> 2),
+               'long Return destination after stock input gates')
+    patch_word(patched, *STANDBY_WAKE, 0x0c000000 | (ps['ringnav_standby_wake'] >> 2),
+               'Wake: Double press after Standby')
+    scan, load, limit, count = SCAN_LIMIT
+    patch_word(patched, scan, load, 0x0c000000 | (ps['ringnav_scan_room'] >> 2), 'scan up to 65,000 songs')
+    patch_word(patched, scan + 4, limit, count, 'scan up to 65,000 songs')
+    patch_word(patched, *DROP_CACHES, 'keep the page cache')
+    for address, old, new in LDAC_HQ:
+        patch_word(patched, address, old, new, 'LDAC HQ sends 990 kbps')
+    patch_word(patched, WHEEL_TS_READ[0], WHEEL_TS_READ[1], 0x0c000000 | ps['ringnav_ts_read'] >> 2, 'wheel ticks')
+    for address in SORT_TRIMS:
+        patch_word(patched, address, 0x04110000 | (syms['toolsTrimLeft'] - address - 4) >> 2 & 0xffff,
+                   0x0c000000 | (ps['ringnav_sort_key'] >> 2), 'sort without a leading article')
+    for address, name in ALBUM_ART:
+        patch_word(patched, address, 0x0320f809, 0x0c000000 | (ps[name] >> 2), 'same-named albums apart in art')
+    for row in ALBUM_ART_ROW:
+        patch_word(patched, *row, 'same-named albums apart in art')
+    patch_word(patched, CLASS_ICON, 0x04110000 | (syms['class_icon'] - CLASS_ICON - 4) >> 2 & 0xffff,
+               0x0c000000 | (ps['ringnav_class_icon'] >> 2), 'Artists rows without the head picture')
+    for word in COVER_PAUSE:
+        patch_word(patched, *word, 'album grids never pause the cover worker')
+    for word in ARTIST_COVER_ROW:
+        patch_word(patched, *word, "an artist's albums request the covers in view")
+    # Local art completion: pass the worker's copied key, then validate the row under aclist_mutex.
+    patch_word(patched, 0x4edd9c, 0x8f99b6d4, 0x27a61688, 'cover completion key')
+    patch_word(patched, 0x4edda0, 0x0411ff44, 0x0c000000 | ps['ringnav_cover_done'] >> 2,
+               'discard stale cover completion')
+    # The folder-cover path branched past the key (b 0x4edda0); it enters at the key as the others do.
+    patch_word(patched, 0x4eeddc, 0x1000fbf0, 0x1000fbef, 'folder cover completion key')
+    # Pin added private entry points as well as every replaced instruction, and the stock bitmap,
+    # canvas and slide_menu entries Coverflow's depth renderer calls (docs/internals.md#coverflow-depth).
+    for name, original in AUDIT['private_prologues'].items():
+        off = fileoff(raw_demo, syms[name])
+        check(raw_demo[off:off+12].hex() == original, f'{name}: unexpected stock entry')
+    for address, original in AUDIT['event_abi_words'].items():
+        off = fileoff(raw_demo, int(address, 16))
+        check(raw_demo[off:off+4].hex() == original, f'{address}: unexpected event ABI instruction')
+    code_changes = []
+    if ipod:
+        code_changes = patch_code(patched, ps)
+    # Single shared version literal: the updater refuses an equal firmware_v20.info version (update_firmware
+    # 0x4f8440, check_otginfo 0x4f8968), so it carries the build tag and stock V1.32 can be flashed back.
+    # About's FW. Version row reads it too (0x4bc52c); ringnav_about shows STOCK_VERSION there instead.
+    check(patched.count(b'V1.32\0') == 1, 'Version literal is not unique')
+    check(len(version) + 1 == len(b'V1.32\0'),
+          'VERSION must be three single digits (x.y.z): the 5-character tag would shift every later file offset')
+    patched = patched.replace(b'V1.32\0', version.encode()+b'\0')
+    patched = patched.replace(*RTC_WRITE)
+    check(re.search(r'\.pdr +PROGBITS +0+ +0*%x +0*%x ' % PDR, run('readelf', '-SW', demo)) and
+          all(p[1]+p[4] <= PDR[0] for _,p in segments(patched) if p[0] == 1), '.pdr: not the audited section')
+    patched[PDR[0]:PDR[0]+PDR[1]] = bytes(PDR[1])
+    append_payload(patched, payload, BASE, ps['__scratch_end']-BASE, 'demo')
+    (out/'demo').write_bytes(patched)
+    # Pseudo-file round trip preserves every original inode's metadata and hardlinks.
+    pseudo = out/'root.pseudo'
+    run('unsquashfs','-pf',pseudo,sq)
+    p = pseudo.read_bytes()
+    # mksquashfs takes "/" from the source dir, not the pseudo file; carry stock values over.
+    root = re.search(rb'^/ D (\d+) (\d+) (\d+) (\d+)$',p,re.M)
+    check(root is not None, 'Missing root pseudo inode')
+    t,mode,uid,gid = (x.decode() for x in root.groups())
+    rootargs = ['-root-time',t,'-root-mode',mode,'-root-uid',uid,'-root-gid',gid]
+    # Paths are passed through a shell by mksquashfs F entries; quote them explicitly.
+    def inode(p, path): return re.search(rb'^'+re.escape(path)+rb' R (\d+) (\d+) (\d+) (\d+) .+$',p,re.M)
+    def swap_inode(p, path, src):
+        line = inode(p, path)
+        check(line is not None, f'Missing {path.decode()} pseudo inode')
+        return p[:line.start()]+path+b' F '+b' '.join(line.groups())+b' cat '+shlex.quote(str(src)).encode()+p[line.end():]
+    (out/'S90play').write_bytes(patch_s90play(cat(S90PLAY)))
+    logo_data = logo.read_bytes()
+    check(jpeg_size(logo_data) == (320, 375), 'Logo must be 320x375 like the stock splash')
+    # Package exactly the validated bytes, even if the input is edited during compression.
+    logo = out/'logo.jpg'
+    logo.write_bytes(logo_data)
+    for path, src in ((b'release/bin/demo', out/'demo'), (b'usr/bin/hciplayer', out/'peq/hciplayer'),
+                      (BLUEALSA.encode(), out/'bluealsa'), (WATCHDOG.encode(), out/'watchdog'),
+                      (S90PLAY.encode(), out/'S90play'), (b'release/assets/default/raw/images/xx/logo.jpg', logo)):
+        p = swap_inode(p, path, src)
+    # New inodes, each with its stock image's metadata: the Stock build's Coverflow card icons (menu_music's),
+    # the Local Music and Spotify rows' icons, drawn in assets/icons/ (stock's 52px style) or else a copy of the stock image named
+    # (not the copies iPod pre-sizes for Settings), and q2video.
+    xx = 'release/assets/default/raw/images/xx/'
+    icons = {} if ipod else {n: (n.replace('coverflow', 'music'), (ROOT/'assets/icons'/n).read_bytes()) for n in ICONS}
+    drawn = ('podcasts', 'audiobooks', 'books', 'videos')
+    icons.update({f'local_{n}.png': (like, (ROOT/'assets/icons'/f'local_{n}.png').read_bytes() if n in drawn
+                                     else cat(xx+like)) for n, like in dict(
+        shuffle='playset_playmode.png', scrobble='wifiset_wifi.png', podcasts='netservice_dlna.png',
+        audiobooks='playset_foldercover.png', photos='playset_covermode.png', books='system_language.png',
+        videos='system_display.png', longsongs='system_time.png').items()})
+    for n in ('spotify', 'radio'):  # Streaming's Spotify and Internet Radio rows
+        icons[f'stream_{n}.png'] = ('list_tidal.png', (ROOT/'assets/icons'/f'stream_{n}.png').read_bytes())
+    icons['stream_airplay.png'] = ('list_tidal.png', cat(xx+'netservice_airplay.png'))  # iPod resizes stock's
+    if ipod:  # Home's placeholder, drawn at the art panel's 290px
+        icons['default_album_home.png'] = ('default_album_big.png', (ROOT/'assets/icons/default_album_home.png').read_bytes())
+    added = []
+    for path, (like, data) in {**{xx+n: (xx+l, d) for n, (l, d) in icons.items()},
+                               HELPER: (HELPER_LIKE, compile_helper(out, cat, 'video', 'q2video', HELPER_LIBS)),
+                               SCROBBLE_CA: ('etc/hosts', (ROOT/'assets/scrobble-ca.pem').read_bytes()),
+                               BOOT: (HELPER_LIKE, compile_helper(out, cat, 'boot', 'q2boot', HELPER_LIBS[:1]))}.items():
+        stock = inode(p, like.encode())
+        check(stock is not None, f'Missing stock inode for {path}')
+        name = path.rsplit('/', 1)[-1]
+        if path not in (HELPER, BOOT): (out/name).write_bytes(data)  # package the hashed bytes, as the logo
+        path = path.encode()
+        entry = path+b' F '+b' '.join(stock.groups())+b' cat '+shlex.quote(str(out/name)).encode()+b'\n'
+        at = p.index(b'# START OF DATA')  # definitions precede the embedded data
+        p = p[:at]+entry+p[at:]
+        added.append([path, b'R', *stock.groups()])
+    removed = []
+    for path in STOCK_EQ + OBSOLETE + (CAROUSEL if ipod else []):
+        line = re.search(rb'^'+re.escape(path.encode())+rb' R .+\n', p, re.M)
+        check(line is not None, f'Missing stock inode {path}')
+        removed.append(line.group().split()[:6])
+        p = p[:line.start()]+p[line.end():]
+    changed_assets = {}
+    original = cat(FONT)
+    data = font_quotes(original)
+    (out/'default.ttf').write_bytes(data)
+    p = swap_inode(p, FONT.encode(), out/'default.ttf')
+    changed_assets[FONT] = dict(original_sha256=sha(original), sha256=sha(data))
+    assets = ['ui/'+rel for rel in (UI_ASSETS if ipod else [ARTIST_PAGE, HOME_PAGE])] + ['strings/en_US.bin']
+    if ipod:
+        assets += ['styles/'+rel for rel in AUDIT['styles']]
+        # settings icons pre-sized to the rows' SET_ICON, in place, so each keeps its inode metadata
+        assets += ['images/'+name for name in SETTINGS_ICONS | QUIET_ICONS]
+    for rel in assets:
+        kind, name = rel.split('/', 1)
+        path = 'release/assets/default/raw/' + ('images/xx/'+name if kind == 'images' else rel)
+        original = cat(path)
+        data = (relabel(original) if kind == 'strings' else
+                patch_style(original, AUDIT['styles'][name]) if kind == 'styles' else
+                (quiet_icon(name, original) if name in QUIET_ICONS else settings_icon(name, original)) if kind == 'images' else patch_asset(name, original, ipod))
+        target = out/rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        p = swap_inode(p, path.encode(), target)
+        changed_assets[path] = dict(original_sha256=sha(original), sha256=sha(data))
+    pseudo.write_bytes(p)
+    (out/'empty').mkdir()
+    newsq = out/'rootfs.squashfs'
+    epoch = struct.unpack_from('<I',sq.read_bytes(),8)[0]
+    run('mksquashfs',out/'empty',newsq,'-pf',pseudo,'-noappend','-comp','lzo',
+        '-b','131072','-Xcompression-level','9','-tailends','-mkfs-time',epoch,*rootargs,'-processors','1','-no-progress')
+    # All inodes, including demo and the logo, keep name/type/mtime/mode/uid/gid (sizes/offsets shift).
+    def inodes(image):
+        text = subprocess.check_output(['unsquashfs','-pf','-',str(image)]).split(b'\n# START OF DATA')[0]
+        return sorted(l.split()[:6] for l in text.splitlines() if l and not l.startswith(b'#'))
+    check(inodes(newsq) == sorted([i for i in inodes(sq) if i not in removed]+added),
+          'Repacked rootfs metadata differs from stock')
+    blobs['recovery-update/rootfs.squashfs'] = newsq.read_bytes()
+    # Stock image proves this size fits; do not enlarge beyond its padded size.
+    check(len(blobs['recovery-update/rootfs.squashfs']) <= sq.stat().st_size, 'Repacked rootfs exceeds stock size')
+    blobs['firmware_v20.info'] = (f'Shanling Q2\n{version}\n'+''.join(
+        hashlib.md5(blobs[n]).hexdigest()+'  '+n+'\n' for n in [
+            'recovery-update/xImage','recovery-update/rootfs.squashfs'])).encode()
+    with tarfile.open(out/'update.tar','w',format=tarfile.GNU_FORMAT) as t:
+        for m in meta:
+            data = blobs.get(m.name)
+            if data is not None: m.size=len(data)
+            t.addfile(m,io.BytesIO(data) if data is not None else None)
+    manifest = dict(input_zip_sha256=ZIP_SHA, stock_demo_sha256=DEMO_SHA, source_sha256=source,
+        demo_sha256=sha(patched), patch_sha256=sha(payload), update_sha256=sha((out/'update.tar').read_bytes()),
+        rootfs_sha256=sha(newsq.read_bytes()), kernel_sha256=sha(blobs['recovery-update/xImage']),
+        patch_bytes=len(payload), ring_step_pixels=RING_STEP,
+        version=version, variant=variant, dev=dev, peq=audio, bluealsa_sha256=sha(bluealsa), q2video_sha256=sha((out/'q2video').read_bytes()), q2boot_sha256=sha((out/'q2boot').read_bytes()), compact_code=code_changes, changed_assets=changed_assets, logo_sha256=sha(logo_data),
+        patch_symbols={n:hex(v) for n,v in ps.items() if n.startswith('stock_')},
+        tools={t:run(t,'--version').splitlines()[0] for t in ['clang','ld.lld','llvm-objcopy']} |
+              ({'imagemagick': imagemagick('-version', data=b'').decode().splitlines()[0]} if ipod else {}))
+    (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    print(json.dumps({k:manifest[k] for k in ['update_sha256','patch_bytes','version']},indent=2))
+
+if __name__ == '__main__':
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('zip',type=pathlib.Path)
+    ap.add_argument('--out',type=pathlib.Path,default=ROOT/'build')
+    ap.add_argument('--logo',type=pathlib.Path,default=ROOT/'assets/boot-logo.jpg',
+                    help='320x375 JPEG boot splash (default: assets/boot-logo.jpg)')
+    ap.add_argument('--ipod', action='store_true', help='iPod UI: compact local browsing and long Return to Now Playing')
+    ap.add_argument('--dev', action='store_true',
+                    help='development build: tag from the next .build-number (V001i, V002i...); never a release input')
+    a=ap.parse_args()
+    try:
+        build(a.zip,a.out.resolve(),a.logo,a.ipod,a.dev)
+    except (OSError, ValueError, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
+        ap.error(str(exc))

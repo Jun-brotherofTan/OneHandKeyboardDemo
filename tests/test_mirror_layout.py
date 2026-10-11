@@ -129,7 +129,23 @@ class MirrorLayoutTests(unittest.TestCase):
             root = Path(directory)
             (root / "nested").mkdir()
             (root / "nested" / "part.txt").write_text("hello", encoding="utf-8")
-            self.assertEqual(read_corpus(root), "hello")
+            (root / "nested" / "module.py").write_text("world", encoding="utf-8")
+            self.assertEqual(read_corpus(root), "world\nhello")
+
+    def test_corpus_loading_ignores_hidden_and_generated_folders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.py").write_text("visible", encoding="utf-8")
+            ignored_names = (
+                ".hidden", ".git", ".venv", "venv", "__pycache__", "site-packages",
+                "node_modules", "build", "dist",
+            )
+            for name in ignored_names:
+                folder = root / name
+                folder.mkdir()
+                (folder / "ignored.py").write_text(name, encoding="utf-8")
+
+            self.assertEqual(read_corpus(root), "visible")
 
     def test_summary_csv_contains_all_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
