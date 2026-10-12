@@ -48,21 +48,27 @@ def load_layout_profile(
         shortcut_file = Path(shortcut_path)
         with shortcut_file.open(encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
-            if not reader.fieldnames or "physical_key" not in reader.fieldnames:
-                raise ValueError("Shortcut CSV must contain a physical_key column.")
-            value_field = next(
-                (name for name in ("shortcut", "output") if name in reader.fieldnames),
-                None,
-            )
-            if value_field is None:
-                raise ValueError("Shortcut CSV must contain a shortcut or output column.")
-            for row in reader:
+            if reader.fieldnames != ["physical_key", "shortcut"]:
+                raise ValueError(
+                    "Shortcut CSV header must be exactly: physical_key,shortcut"
+                )
+            supported_keys = {key.normal for key in KEYS}
+            for row_number, row in enumerate(reader, start=2):
+                if None in row or row.get("physical_key") is None or row.get("shortcut") is None:
+                    raise ValueError(
+                        f"Malformed shortcut CSV row {row_number}: expected two columns."
+                    )
                 key = row["physical_key"].strip().lower()
-                if key not in layout.mirror_by_physical:
+                if key not in supported_keys:
                     raise ValueError(f"Shortcut profile contains an inactive key: {key}")
                 if key in shortcut_mapping:
                     raise ValueError(f"Duplicate physical key in shortcut profile: {key}")
-                shortcut_mapping[key] = row[value_field]
+                shortcut = row["shortcut"]
+                if not shortcut:
+                    raise ValueError(
+                        f"Malformed shortcut CSV row {row_number}: shortcut cannot be empty."
+                    )
+                shortcut_mapping[key] = shortcut
         shortcut_name = shortcut_file.name
 
     normal_mapping = {key.normal: key.normal for key in KEYS}

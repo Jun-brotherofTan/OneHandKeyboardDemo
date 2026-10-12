@@ -15,6 +15,7 @@ from mirror_keyboard.keyboard_hook import (
     VK_MENU,
     VK_LMENU,
     VK_RMENU,
+    VK_S,
     WM_KEYDOWN,
     WM_KEYUP,
     LLKHF_EXTENDED,
@@ -64,6 +65,7 @@ class FakeHookSession:
         self.taps = 0
         self.shutdowns = 0
         self.modifier_events = []
+        self.physical_keys = []
 
     def right_alt_tap(self):
         self.taps += 1
@@ -73,6 +75,10 @@ class FakeHookSession:
 
     def report_modifier_event(self, description):
         self.modifier_events.append(description)
+
+    def handle_physical_key(self, physical_key, **_kwargs):
+        self.physical_keys.append(physical_key)
+        return None
 
 
 class MirrorKeyboardTestTests(unittest.TestCase):
@@ -141,11 +147,170 @@ class MirrorKeyboardTestTests(unittest.TestCase):
         self.assertEqual(state.labels["q"], "self.")
         self.assertEqual(machine.press("q", now=1.0).output, "self.")
 
-    def test_shortcut_preview_without_profile_preserves_normal_key_output(self):
+    def test_shortcut_csv_preserves_spaces_and_punctuation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shortcut_csv = Path(directory) / "shortcuts.csv"
+            shortcut_csv.write_text(
+                "physical_key,shortcut\nq,self.\nw,import \ne,return \nr,name\nt,data\n",
+                encoding="utf-8",
+            )
+            profile = load_layout_profile(ROOT / "layout_C.csv", shortcut_csv)
+        self.assertEqual(profile.shortcut_mapping["q"], "self.")
+        self.assertEqual(profile.shortcut_mapping["w"], "import ")
+        self.assertEqual(profile.shortcut_mapping["e"], "return ")
+
+    def test_shortcut_csv_rejects_duplicate_unsupported_and_malformed_rows(self):
+        invalid_contents = (
+            "physical_key,shortcut\nq,first\nq,second\n",
+            "physical_key,shortcut\np,unsupported\n",
+            "physical_key,shortcut\nq\n",
+            "physical_key,shortcut\nq,\n",
+        )
+        for contents in invalid_contents:
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                shortcut_csv = Path(directory) / "shortcuts.csv"
+                shortcut_csv.write_text(contents, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "Shortcut|shortcut|Malformed|Duplicate|inactive"):
+                    load_layout_profile(ROOT / "layout_C.csv", shortcut_csv)
+
+    def test_ctrl_alt_s_without_profile_keeps_previous_mode_and_reports_status(self):
         machine = KeyboardStateMachine(self.profile_c)
+        machine.right_alt_tap(1.0)
+        machine.right_alt_tap(1.1)
+        session = KeyboardTestSession(
+            machine,
+            layout_path=ROOT / "layout_C.csv",
+            hook=FakeHook([]),
+            logger=FakeLogger([]),
+        )
+        hook = WindowsKeyboardHook(session)
+        get_async = lambda key: 0x8000 if key in {VK_CONTROL, VK_MENU} else 0
+
+        self.assertTrue(hook._handle_event(VK_S, WM_KEYDOWN, get_async))
+        state = machine.snapshot()
+        self.assertEqual(state.mode, "MIRROR HELD")
+        self.assertEqual(state.labels["q"], self.profile_c.mirror_mapping["q"])
+        self.assertEqual(state.mirror_status, "HELD ON")
+        self.assertEqual(state.shortcut_status, "Shortcut profile not loaded")
+        self.assertIn("Shortcut profile not loaded", state.event_text)
+
+    def test_normal_shortcut_toggle_returns_to_normal(self):
+        profile = self._shortcut_profile("q,self.\nw,import ")
+        machine = KeyboardStateMachine(profile)
+        self.assertTrue(machine.toggle_shortcut())
+        self.assertEqual(machine.snapshot().mode, "SHORTCUT")
+        self.assertFalse(machine.toggle_shortcut())
+        self.assertEqual(machine.snapshot().mode, "NORMAL")
+
+    def test_held_mirror_to_shortcut_clears_mirror(self):
+        profile = self._shortcut_profile("q,self.")
+        machine = KeyboardStateMachine(profile)
+        machine.right_alt_tap(1.0)
+        machine.right_alt_tap(1.1)
+        self.assertEqual(machine.snapshot().mode, "MIRROR HELD")
+        session = KeyboardTestSession(
+            machine,
+            layout_path=ROOT / "layout_C.csv",
+            logger=FakeLogger([]),
+        )
+        hook = WindowsKeyboardHook(session)
+        self._send_shortcut_hotkey(hook)
+        state = machine.snapshot()
+        self.assertEqual(state.mode, "SHORTCUT")
+        self.assertEqual(state.mirror_status, "OFF")
+        self.assertEqual(state.labels["q"], "self.")
+
+    def test_shortcut_to_mirror_exits_shortcut(self):
+        profile = self._shortcut_profile("q,self.")
+        machine = KeyboardStateMachine(profile)
         machine.toggle_shortcut()
-        self.assertEqual(machine.snapshot().labels["q"], "—")
-        self.assertEqual(machine.press("q", now=1.0).output, "q")
+        machine.right_alt_tap(1.0)
+        machine.right_alt_tap(1.1)
+        state = machine.snapshot()
+        self.assertEqual(state.mode, "MIRROR HELD")
+        self.assertEqual(state.mirror_status, "HELD ON")
+        self.assertEqual(state.labels["q"], profile.mirror_mapping["q"])
+
+    def test_shortcut_layer_labels_use_profile_values_not_placeholders(self):
+        profile = self._shortcut_profile("q,self.\nw,import ")
+        machine = KeyboardStateMachine(profile)
+        machine.toggle_shortcut()
+        labels = machine.snapshot().labels
+        self.assertEqual(labels["q"], "self.")
+        self.assertEqual(labels["w"], "import ")
+        self.assertEqual(labels["e"], "e")
+        self.assertNotIn("—", labels.values())
+
+    def test_shortcut_key_suppresses_original_and_emits_mapping_once(self):
+        profile = self._shortcut_profile("q,self.")
+        machine = KeyboardStateMachine(profile)
+        machine.toggle_shortcut()
+        session = KeyboardTestSession(
+            machine,
+            layout_path=ROOT / "layout_C.csv",
+            logger=FakeLogger([]),
+        )
+        hook = WindowsKeyboardHook(session)
+        emitted = []
+        hook._emit_unicode = emitted.append
+        get_async = lambda _key: 0
+
+        self.assertTrue(hook._handle_event(ord("Q"), WM_KEYDOWN, get_async))
+        self.assertTrue(hook._handle_event(ord("Q"), WM_KEYDOWN, get_async))
+        self.assertTrue(hook._handle_event(ord("Q"), WM_KEYUP, get_async))
+        self.assertEqual(emitted, ["self."])
+        self.assertIn("Pressed Q -> emitted self.", machine.snapshot().event_text)
+        self.assertEqual(machine.snapshot().highlighted_key, "q")
+
+    def test_unmapped_shortcut_key_passes_through(self):
+        profile = self._shortcut_profile("q,self.")
+        machine = KeyboardStateMachine(profile)
+        machine.toggle_shortcut()
+        session = KeyboardTestSession(
+            machine,
+            layout_path=ROOT / "layout_C.csv",
+            logger=FakeLogger([]),
+        )
+        hook = WindowsKeyboardHook(session)
+        emitted = []
+        hook._emit_unicode = emitted.append
+        self.assertFalse(hook._handle_event(ord("W"), WM_KEYDOWN, lambda _key: 0))
+        self.assertFalse(hook._handle_event(ord("W"), WM_KEYUP, lambda _key: 0))
+        self.assertEqual(emitted, [])
+        self.assertIn("passed through", machine.snapshot().event_text)
+
+    def test_injected_shortcut_output_does_not_reenter_physical_key_handler(self):
+        session = FakeHookSession()
+        hook = WindowsKeyboardHook(session)
+        handled = hook.dispatch_hook_event(
+            ord("S"), WM_KEYDOWN, lambda _key: 0, injected=True
+        )
+        self.assertFalse(handled)
+        self.assertEqual(session.physical_keys, [])
+
+    def test_long_shortcut_output_is_emitted_exactly_as_loaded(self):
+        shortcut = ".append((self, return_value)) "
+        profile = self._shortcut_profile('q,".append((self, return_value)) "')
+        machine = KeyboardStateMachine(profile)
+        machine.toggle_shortcut()
+        emission = machine.press("q", now=1.0)
+        self.assertTrue(emission.suppress_original)
+        self.assertEqual(emission.output, shortcut)
+        self.assertEqual(machine.snapshot().labels["q"], shortcut)
+
+    def _shortcut_profile(self, rows):
+        with tempfile.TemporaryDirectory() as directory:
+            shortcut_csv = Path(directory) / "shortcuts.csv"
+            shortcut_csv.write_text(
+                f"physical_key,shortcut\n{rows}\n", encoding="utf-8"
+            )
+            return load_layout_profile(ROOT / "layout_C.csv", shortcut_csv)
+
+    @staticmethod
+    def _send_shortcut_hotkey(hook):
+        get_async = lambda key: 0x8000 if key in {VK_CONTROL, VK_MENU} else 0
+        hook._handle_event(VK_S, WM_KEYDOWN, get_async)
+        hook._handle_event(VK_S, WM_KEYUP, get_async)
 
     def test_profile_switch_replaces_visible_mapping(self):
         machine = KeyboardStateMachine(self.profile_a)
@@ -281,9 +446,13 @@ class MirrorKeyboardTestTests(unittest.TestCase):
         from mirror_keyboard_test import build_parser
 
         args = build_parser().parse_args(
-            ["--layout", "layout_C.csv", "--mirror-key", "f12", "--verbose"]
+            [
+                "--layout", "layout_C.csv", "--shortcuts", "shortcuts.csv",
+                "--mirror-key", "f12", "--verbose",
+            ]
         )
         self.assertEqual(args.mirror_key, "f12")
+        self.assertEqual(args.shortcut_profile, "shortcuts.csv")
         self.assertTrue(args.verbose)
 
     def test_emergency_hotkey_event_requests_shutdown(self):

@@ -16,7 +16,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--layout", default="layout_A.csv", help="layout mapping CSV")
     parser.add_argument(
+        "--shortcuts",
         "--shortcut-profile",
+        dest="shortcut_profile",
         help="optional CSV with physical_key,shortcut columns",
     )
     parser.add_argument("--double-tap-ms", type=int, default=300)

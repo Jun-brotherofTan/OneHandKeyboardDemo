@@ -9,7 +9,7 @@ from threading import Event
 from time import monotonic
 
 from mirror_keyboard.layout_loader import load_layout_profile, standard_profile_paths
-from mirror_keyboard.state_machine import KeyboardStateMachine, ViewState
+from mirror_keyboard.state_machine import KeyboardStateMachine, KeyEmission, ViewState
 from mirror_keyboard.usage_logger import UsageLogger
 
 
@@ -60,17 +60,18 @@ class KeyboardTestSession:
     def right_alt_tap(self) -> None:
         self.state_machine.right_alt_tap(self.clock())
 
-    def handle_physical_key(self, physical_key: str, *, shifted: bool = False) -> str:
+    def handle_physical_key(self, physical_key: str, *, shifted: bool = False) -> KeyEmission:
         result = self.state_machine.press(
             physical_key, now=self.clock(), shifted=shifted
         )
-        self.logger.record(
-            self.state_machine.profile.name,
-            result.mode,
-            result.physical_key,
-            result.output,
-        )
-        return result.output
+        if result.suppress_original:
+            self.logger.record(
+                self.state_machine.profile.name,
+                result.mode,
+                result.physical_key,
+                result.output,
+            )
+        return result
 
     def toggle_shortcut_mode(self) -> None:
         self.state_machine.toggle_shortcut()

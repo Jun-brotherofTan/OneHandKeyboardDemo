@@ -117,15 +117,14 @@ class WindowsKeyboardHook:
                 message_id,
                 injected,
             )
-            if injected:
-                return call_next(code, message_id, data_pointer)
             try:
-                handled = self._handle_event(
+                handled = self.dispatch_hook_event(
                     event.vkCode,
                     message_id,
                     user32.GetAsyncKeyState,
                     scan_code=event.scanCode,
                     flags=event.flags,
+                    injected=injected,
                 )
             except Exception as error:
                 self.session.report_error(f"Keyboard hook error: {error}")
@@ -281,18 +280,43 @@ class WindowsKeyboardHook:
         if control or self._is_down(get_async_key_state, VK_LMENU):
             return False
         if is_down:
-            self._pressed_active.add(virtual_key)
-            output = self.session.handle_physical_key(
+            if virtual_key in self._pressed_active:
+                return True
+            emission = self.session.handle_physical_key(
                 physical_key,
                 shifted=self._is_down(get_async_key_state, VK_SHIFT),
             )
-            if output:
-                self._emit_unicode(output)
+            if not emission.suppress_original:
+                return False
+            self._pressed_active.add(virtual_key)
+            if emission.output:
+                self._emit_unicode(emission.output)
             return True
         if virtual_key in self._pressed_active:
             self._pressed_active.discard(virtual_key)
             return True
         return False
+
+    def dispatch_hook_event(
+        self,
+        virtual_key: int,
+        message_id: int,
+        get_async_key_state,
+        *,
+        scan_code: int = 0,
+        flags: int = 0,
+        injected: bool = False,
+    ) -> bool:
+        """Return whether the physical event is suppressed; ignore synthetic input."""
+        if injected:
+            return False
+        return self._handle_event(
+            virtual_key,
+            message_id,
+            get_async_key_state,
+            scan_code=scan_code,
+            flags=flags,
+        )
 
     @staticmethod
     def _emit_unicode(text: str) -> None:

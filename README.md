@@ -113,9 +113,28 @@ and the active mode/profile plus recent key output appear in the status area.
 
 Tap Right Alt once for a one-shot mirror after the double-tap interval; tap it
 twice within 300 ms to latch mirror mode, then tap once to turn the latch off.
-Change the interval with `--double-tap-ms`. Shortcut display/output can be
-enabled with `Ctrl+Alt+S`; provide an optional CSV containing
-`physical_key,shortcut` columns with `--shortcut-profile shortcuts.csv`.
+Change the interval with `--double-tap-ms`. Shortcut mode requires a valid
+CSV mapping and can be loaded with `--shortcuts`:
+
+```csv
+physical_key,shortcut
+q,self.
+w,"import "
+e,"return "
+r,name
+t,data
+```
+
+```powershell
+python mirror_keyboard_test.py --layout layout_C.csv --shortcuts shortcuts.csv
+```
+
+`Ctrl+Alt+S` toggles between NORMAL and SHORTCUT. Without a loaded shortcut
+profile, the mode does not change and the status reports `Shortcut profile not
+loaded`. Mapped key presses suppress the original character and emit the CSV
+string once; keys without a mapping pass through normally. Shortcut and mirror
+layers are mutually exclusive. The older `--shortcut-profile` option is an
+alias for `--shortcuts`.
 Switch profiles with `Ctrl+Alt+1` through `Ctrl+Alt+5`, which load
 `layout_A.csv` through `layout_E.csv` beside the selected layout file. The
 overlay highlights the physical source key and reports the emitted character

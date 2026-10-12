@@ -34,6 +34,7 @@ class KeyEmission:
     physical_key: str
     output: str
     mode: str
+    suppress_original: bool = True
 
 
 class KeyboardStateMachine:
@@ -48,6 +49,7 @@ class KeyboardStateMachine:
         self._highlighted_key: str | None = None
         self._event_text = "Ready"
         self._modifier_event = "No mirror modifier event detected yet"
+        self._status_message = ""
         self._listeners: list[Callable[[ViewState], None]] = []
         self._lock = RLock()
 
@@ -68,7 +70,9 @@ class KeyboardStateMachine:
             if self._shortcut_active:
                 mode = "SHORTCUT"
                 labels = {
-                    key.normal: self.profile.shortcut_mapping.get(key.normal, "—")
+                    key.normal: self.profile.shortcut_mapping.get(
+                        key.normal, self.profile.normal_mapping[key.normal]
+                    )
                     for key in KEYS
                 }
             elif self._mirror_state in {MirrorState.ONE_SHOT, MirrorState.HELD}:
@@ -78,7 +82,9 @@ class KeyboardStateMachine:
                 mode = "NORMAL"
                 labels = dict(self.profile.normal_mapping)
 
-            if self._mirror_state == MirrorState.WAITING_FOR_SECOND_TAP:
+            if self._shortcut_active:
+                mirror_status = "OFF"
+            elif self._mirror_state == MirrorState.WAITING_FOR_SECOND_TAP:
                 mirror_status = "WAITING FOR SECOND TAP"
             elif self._mirror_state == MirrorState.ONE_SHOT:
                 mirror_status = "ONE-SHOT ARMED"
@@ -86,10 +92,10 @@ class KeyboardStateMachine:
                 mirror_status = "HELD ON"
             else:
                 mirror_status = "OFF"
-            shortcut_status = (
+            shortcut_status = self._status_message or (
                 self.profile.shortcut_profile_name
                 if self.profile.shortcut_mapping
-                else "not loaded (Ctrl+Alt+S preview)"
+                else "Shortcut profile not loaded"
             )
             return ViewState(
                 profile_name=self.profile.name,
@@ -123,6 +129,9 @@ class KeyboardStateMachine:
     def right_alt_tap(self, now: float) -> None:
         self.advance_time(now)
         with self._lock:
+            if self._shortcut_active:
+                self._shortcut_active = False
+                self._status_message = ""
             if self._mirror_state == MirrorState.HELD:
                 self._mirror_state = MirrorState.NORMAL
                 self._second_tap_deadline = None
@@ -140,15 +149,18 @@ class KeyboardStateMachine:
             raise ValueError(f"Not an active physical key: {physical_key}")
         self.advance_time(now)
         with self._lock:
+            suppress_original = True
             if self._mirror_state == MirrorState.WAITING_FOR_SECOND_TAP:
                 self._mirror_state = MirrorState.ONE_SHOT
                 self._second_tap_deadline = None
 
             if self._shortcut_active:
                 mode = "SHORTCUT"
-                output = self.profile.shortcut_mapping.get(
-                    key, self.profile.normal_mapping[key]
-                )
+                output = self.profile.shortcut_mapping.get(key)
+                if output is None:
+                    self._event_text = f"Pressed {key.upper()} -> passed through"
+                    output = ""
+                    suppress_original = False
             elif self._mirror_state in {MirrorState.ONE_SHOT, MirrorState.HELD}:
                 mode = self._mirror_state.value
                 output = self.profile.mirror_mapping[key]
@@ -156,19 +168,37 @@ class KeyboardStateMachine:
                 mode = "NORMAL"
                 output = self.profile.normal_mapping[key]
 
-            if shifted and mode != "SHORTCUT":
+            if shifted and mode != "SHORTCUT" and suppress_original:
                 output = _shift_output(output)
             if self._mirror_state == MirrorState.ONE_SHOT:
                 self._mirror_state = MirrorState.NORMAL
-            self._highlighted_key = key
-            self._event_text = f"Pressed {key.upper()} -> emitted {output or '(no shortcut assigned)'}"
+            if suppress_original:
+                self._highlighted_key = key
+                self._event_text = f"Pressed {key.upper()} -> emitted {output}"
+            self._status_message = ""
         self._publish()
-        return KeyEmission(key, output, mode)
+        return KeyEmission(key, output, mode, suppress_original=suppress_original)
 
-    def toggle_shortcut(self) -> None:
+    def toggle_shortcut(self) -> bool:
         with self._lock:
-            self._shortcut_active = not self._shortcut_active
+            if not self.profile.shortcut_mapping:
+                self._status_message = "Shortcut profile not loaded"
+                self._event_text = self._status_message
+                active = False
+            elif self._shortcut_active:
+                self._shortcut_active = False
+                self._status_message = ""
+                self._event_text = "Shortcut mode off"
+                active = False
+            else:
+                self._shortcut_active = True
+                self._mirror_state = MirrorState.NORMAL
+                self._second_tap_deadline = None
+                self._status_message = ""
+                self._event_text = "Shortcut mode active"
+                active = True
         self._publish()
+        return active
 
     def switch_profile(self, profile: KeyboardProfile) -> None:
         with self._lock:
